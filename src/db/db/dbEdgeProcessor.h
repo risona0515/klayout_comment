@@ -400,14 +400,22 @@ public:
   /**
    *  @brief Implementation of the EdgeSink interface
    */
+  // [[ZH]] 功能：投递开始 —— 在首次 start() 时按需清空输出容器，并转发给链式容器。
+  // [[ZH]] ★ 「单次生效(single-shot)」机制：清空后立刻把 m_clear 置为 false，
+  // [[ZH]]   因此**只清一次**。原因见行内英文注释：尺寸过滤器之类的处理会分多帧
+  // [[ZH]]   投递（多次 start/flush），若每次 start 都清空就会把前几帧的结果抹掉。
+  // [[ZH]] 修改：mp_edges 指向的内容（可能被清空）、m_clear 置 false、
+  // [[ZH]]       并递归调用 mp_chained->start()。
   virtual void start () 
   {
     if (m_clear) {
+      // [[ZH]] 只在第一次清空，随后立刻关闭该标志 —— 这就是 single-shot 的含义。
       mp_edges->clear ();
       //  The single-shot scheme is a easy way to overcome problems with multiple start/flush brackets (i.e. on size filter)
       m_clear = false;
     }
     if (mp_chained) {
+      // [[ZH]] 链式转发：先让下游容器也进入 start 状态。
       mp_chained->start ();
     }
   }
@@ -415,6 +423,9 @@ public:
   /**
    *  @brief Implementation of the EdgeSink interface
    */
+  // [[ZH]] 功能：收取一条边 —— 无条件追加，并转发给链式容器。
+  // [[ZH]] 修改：向 mp_edges 追加元素。
+  // [[ZH]] 注意：本重载**不检查** m_tag（因为该版本没有标签信息可比较）。
   virtual void put (const db::Edge &e) 
   {
     mp_edges->push_back (e);
@@ -426,17 +437,29 @@ public:
   /**
    *  @brief Implementation of the EdgeSink interface
    */
+  // [[ZH]] 功能：收取一条**带标签**的边，按 m_tag 过滤后才追加，并转发给链式容器。
+  // [[ZH]] 修改：仅当 (m_tag == 0 表示不限) 或 (tag == m_tag) 时向 mp_edges 追加。
+  // [[ZH]] 坑：★ 链式转发**不受过滤影响** —— 无论是否通过过滤，都会调
+  // [[ZH]]     mp_chained->put(e, tag)。即下游容器会看到全部边，可能自行过滤。
   virtual void put (const db::Edge &e, int tag)
   {
     if (m_tag == 0 || tag == m_tag) {
+      // [[ZH]] 通过标签过滤（m_tag == 0 表示"标签不限"）。
       mp_edges->push_back (e);
     }
     if (mp_chained) {
+      // [[ZH]] 注意：这一句在 if 之外 —— 过滤只影响本容器，不影响下游。
       mp_chained->put (e, tag);
     }
   }
 
 private:
+  // [[ZH]] m_edges  ：**内部**存储容器，仅在用第二个构造函数时被使用。
+  // [[ZH]] mp_edges ：实际写入目标 —— 指向外部容器，或指向 m_edges（外部为空的兜底）。
+  // [[ZH]]           用指针间接一层，使两种构造方式共用同一套写入代码。
+  // [[ZH]] m_clear  ：是否需要在首次 start() 时清空（single-shot 标志，用完即关）。
+  // [[ZH]] m_tag    ：只收集该标签的边；0 表示不限。
+  // [[ZH]] mp_chained：可选的链式下游容器，收到的边会同步转发给它；0 表示无。
   std::vector<db::Edge> m_edges;
   std::vector<db::Edge> *mp_edges;
   bool m_clear;
@@ -595,10 +618,56 @@ public:
  *  It will build a set of property pairs, where the lower property value
  *  is the first one of the pairs. 
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  InteractionDetector —— "相互作用检测器"（不产生几何，只报告配对关系）
+// ============================================================================
+//
+// 【与其它评估器的本质区别】
+//   前面那些评估器（SimpleMerge / BooleanOp ...）都通过 edge() 的返回值
+//   **输出结果几何**。而本类**不输出任何边** —— 它把结果记录在内部集合里，
+//   事后通过 begin()/end() 迭代读出"哪些输入多边形之间存在某种关系"。
+//   因此它常配合一个空的 EdgeContainer 使用（sink 只是必需的占位）。
+//
+// 【报告什么】一组 (primary_id, secondary_id) 配对，用 std::set 去重且有序。
+//   ★ 配对中**较小的 property 放前面**，所以迭代出来的顺序是确定的。
+//
+// 【★ property 分工 —— 使用本类的前提】
+//   必须把输入分成"主要(primary)"与"次要(secondary)"两组：
+//       property ∈ [0, last_primary_id]        → primary
+//       property >  last_primary_id            → secondary
+//   这个分界由构造参数 last_primary_id 指定。若不遵守，判定结果无意义。
+//
+// 【四种模式及其含义】
+//   mode =  0  重叠或相切（overlapping / touching）
+//              是否把"相切"算作相互作用由 set_include_touching() 决定。
+//   mode = -1  次要组中**位于主要多边形内部**的所有多边形
+//   mode = -2  主要组中**包围了次要多边形**的所有多边形
+//   mode = +1  次要组中**位于主要多边形外部**的所有多边形
+//
+// 【★ 必须调用 finish() 的情形】
+//   mode = -1、-2、+1 都需要在读取结果**之前**调用 finish()。
+//   原因：这些模式判定的是"包含/排除"关系，必须等整条扫描线跑完、
+//   `m_inside_n`/`m_inside_s` 这些"当前在谁内部"的集合稳定之后才能定论。
+//   mode = 0 是即时的，不需要 finish()。
+//
+// 【上游文档中坦诚标注的已知限制】
+//   单元测试 TEST(26c)/TEST(26d) 的注释里写着 **"does not work yet!"** ——
+//   即 mode = -1 配合某些背景 property 组合时结果不正确。
+//   这是上游已知且未修的问题，使用这些模式时要留意。
+//
+// 【报告格式的一处反直觉设计】
+//   +1（外部）模式下的配对是"**伪配对**"：按定义外部的多边形与主要多边形
+//   并不相交，所以不存在真正的相互作用点。此时报出的 primary_id 恒为
+//   last_primary_id（即一个代表"背景"的合成 id）。上游文档明确说明了这一点，
+//   以免使用者把它当作真实的几何关系。
+// [[ZH-END]]
 class DB_PUBLIC InteractionDetector
   : public EdgeEvaluatorBase
 {
 public:
+  // [[ZH]] interactions_type：结果类型 —— property 配对的集合（std::set，去重且有序）。
+  // [[ZH]] iterator          ：遍历结果的只读迭代器（begin()/end() 返回它）。
   typedef std::set<std::pair<property_type, property_type> > interactions_type;
   typedef interactions_type::const_iterator iterator;
 
@@ -643,6 +712,8 @@ public:
   /**
    *  @brief Gets the "touching" flag
    */
+  // [[ZH]] 功能：读取"相切"标志。
+  // [[ZH]] 附带作用：本值也被当作 prefer_touch() 的返回值，从而影响 edge() 的 enter 实参。
   bool include_touching () const
   {
     return m_include_touching;
@@ -653,6 +724,10 @@ public:
    *
    *  This method must be called in mode -1 and +1 in order to finish the collection.
    */
+  // [[ZH]] 功能：★ 收尾计算 —— 在读取结果**之前**必须对 mode = -1/-2/+1 调用。
+  // [[ZH]] 为什么：这些模式判定的是"包含/排除"关系，必须等整个扫描结束、
+  // [[ZH]]       m_inside_n/m_inside_s 稳定后才能定论，无法在扫描过程中即时给出。
+  // [[ZH]] 修改：向 m_interactions 写入最终的配对结果。
   void finish ();
 
   /**
@@ -660,6 +735,9 @@ public:
    *
    *  The iterator delivers pairs of property values. The lower value will be the first one of the pair.
    */
+  // [[ZH]] 功能：结果迭代起始。遍历得到 (primary_id, secondary_id) 配对，
+  // [[ZH]]       且**较小的 property 恒在第一位**。
+  // [[ZH]] 坑：mode = -1/-2/+1 时若未先调 finish()，这里得到的结果不完整。
   iterator begin () const
   {
     return m_interactions.begin ();
@@ -668,19 +746,35 @@ public:
   /**
    *  @brief Iterator delivering the interactions (end iterator)
    */
+  // [[ZH]] 功能：结果迭代终止（与 begin() 配对使用）。
   iterator end () const
   {
     return m_interactions.end ();
   }
 
+  // [[ZH]] 功能：重置本评估器状态（清空"当前在谁内部"的集合与零计数）。
   virtual void reset ();
+  // [[ZH]] 功能：按 property 总数 n 预分配 m_wcv_n/m_wcv_s。
   virtual void reserve (size_t n);
+  // [[ZH]] 功能：更新该 property 的环绕数，并在 mode=0 时即时记录相互作用配对。
   virtual int edge (bool north, bool enter, property_type p);
+  // [[ZH]] 功能：扫描线上/下两侧的"是否在内部"判定之差。
   virtual int compare_ns () const;
+  // [[ZH]] 功能：两侧"当前在内部的多边形集合"是否都已清空。
   virtual bool is_reset () const { return m_inside_s.empty () && m_inside_n.empty (); }
+  // [[ZH]] 功能：是否把相切算作相互作用 —— 同时决定 edge() 的 enter 实参取值。
   virtual bool prefer_touch () const { return m_include_touching; }
 
 private:
+  // [[ZH]] m_mode           ：上面说明的四种模式之一（0 / -1 / -2 / +1）。
+  // [[ZH]] m_include_touching：是否把"相切"视为相互作用；也作为 prefer_touch() 返回值。
+  // [[ZH]] m_last_primary_id：primary/secondary 的分界。property <= 它为 primary。
+  // [[ZH]] m_wcv_n/m_wcv_s  ：每个 property 各自的环绕数（以 property 为下标）。
+  // [[ZH]] m_inside_n/m_inside_s：当前处于内部的多边形集合（上/下侧）——
+  // [[ZH]]                     用于在扫描过程中累积"谁在谁里面"，finish() 时汇总。
+  // [[ZH]] m_interactions   ：★ 最终结果 —— 去重且有序的 property 配对集合。
+  // [[ZH]] m_non_interactions：暂存"已确定不相互作用"的配对，用于在 finish() 时
+  // [[ZH]]                     反推外部关系（尤其 +1 外部模式）。
   int m_mode;
   bool m_include_touching;
   property_type m_last_primary_id;
@@ -696,6 +790,35 @@ private:
  *  This incarnation of the evaluator class implements an "inside" function
  *  based on a generic operator.
  */
+// [[ZH-BEGIN]]
+// 功能：★ "通用融合"评估器 —— 用**可替换的内外判定函数 F** 实现融合运算的骨架。
+//
+//       它是理解所有融合类评估器的关键：把"什么算内部"抽象成一个函数对象 F，
+//       本类只负责维护环绕数并计算"状态迁移量"。
+//       改变 F 就得到不同的融合规则：
+//         · SimpleMerge = GenericMerge<ParametrizedInsideFunc>（最常用，带 mode）
+//         · dbRegionUtils 里还用自定义 F 做过"奇怪多边形"检测
+//
+// 【★ 本类的 wc 语义】此处 wc = **有向环绕数 (winding number)**，
+//   即射线穿过多边形边界的有向次数。注意这与 MergeOp 的 wc
+//   （"张开的 polygon 个数"）**完全不同**，切勿混淆。
+//   因为是有向的，wc 可以为负 —— 这正是 ParametrizedInsideFunc 要同时处理
+//   正负两种 mode 的原因。
+//
+// 参数：模板参数 F 是谓词，签名约定为 `bool operator()(int wc)`，
+//       返回该环绕数是否代表"在内部"。
+//
+// ★ 实现范式（值得单独记住）：
+//   每次 edge() 都做"**前/后**比较"：
+//         t0 = F(wc)          // 改变之前是否在内部
+//         wc += (enter ? +1 : -1)
+//         t1 = F(wc)          // 改变之后是否在内部
+//         返回 +1 (外→内) / -1 (内→外) / 0 (无变化)
+//   即返回值是**状态迁移量**，不是布尔值。这正是基类文档所说的"累加"协议。
+//
+// 坑：本类**忽略 property 参数 p** —— 它把所有输入边合在一起算一个总环绕数。
+//     若需要按输入分别计数（例如 BooleanOp 要区分 A/B），必须改用别的评估器。
+// [[ZH-END]]
 template <class F>
 class DB_PUBLIC_TEMPLATE GenericMerge
   : public EdgeEvaluatorBase
@@ -704,30 +827,51 @@ public:
   /**
    *  @brief Constructor
    */
+  // [[ZH]] 功能：用给定的内外判定函数 F 构造，环绕数初值置 0。
+  // [[ZH]] 参数：function 内外判定谓词（会被拷贝保存到 m_function）。
   GenericMerge (const F &function) 
     : m_wc_n (0), m_wc_s (0), m_function (function)
   { }
 
+  // [[ZH]] 功能：把上下两侧的环绕数都归零，回到确定初始状态。
+  // [[ZH]] 修改：m_wc_n = m_wc_s = 0。
   virtual void reset ()
   {
     m_wc_n = m_wc_s = 0;
   }
 
+  // [[ZH]] 功能：预分配 —— 本类只用两个 int 计状态，无容器可预留，故为空。
   virtual void reserve (size_t /*n*/)
   {
     // .. nothing yet ..
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：★ 核心 —— 根据这条边更新对应侧的环绕数，并返回状态迁移量。
+  //
+  // 参数：north 选哪一侧（true = 上方 m_wc_n，false = 下方 m_wc_s）；
+  //       enter true → 环绕数 +1，false → -1；
+  //       p     来源标签（★ 本类忽略它）。
+  // 返回：+1 = 由外变内；-1 = 由内变外；0 = 状态未变。
+  //
+  // 修改：选中一侧的环绕数（±1）。
+  // 实现：见上面类注释里的"前/后比较"范式 —— 比较修改前后的 F(wc)。
+  // [[ZH-END]]
   virtual int edge (bool north, bool enter, property_type /*p*/)
   {
+    // [[ZH]] 按 north 选择要更新的那一侧计数器。
     int *wc = north ? &m_wc_n : &m_wc_s;
+    // [[ZH]] t0 = 更新"之前"是否处于内部。
     bool t0 = m_function (*wc);
+    // [[ZH]] 更新环绕数：enter 为真则 +1，否则 -1。
     if (enter) {
       ++*wc;
     } else {
       --*wc;
     }
+    // [[ZH]] t1 = 更新"之后"是否处于内部。
     bool t1 = m_function (*wc);
+    // [[ZH]] 返回状态迁移量：外→内 为 +1，内→外 为 -1，其余为 0。
     if (t1 && ! t0) {
       return 1;
     } else if (! t1 && t0) {
@@ -737,23 +881,37 @@ public:
     }
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：比较"下方"与"上方"的内外状态之差，供引擎给合成的水平边定方向。
+  // 返回：-1 = 下方在内而上方在外；+1 = 上方在内而下方在外；0 = 两侧一致。
+  // 注意：语义等价于 result(south) - result(north) 的符号约定，
+  //       与 MergeOp/BooleanOp 的 compare_ns 保持一致（见各自实现）。
+  // [[ZH-END]]
   virtual int compare_ns () const
   {
     if (m_function (m_wc_s) && ! m_function (m_wc_n)) {
+      // [[ZH]] 下方在内、上方在外 → -1。
       return -1;
     } else if (! m_function (m_wc_s) && m_function (m_wc_n)) {
+      // [[ZH]] 上方在内、下方在外 → +1。
       return 1;
     } else {
+      // [[ZH]] 两侧状态一致 → 无方向偏好。
       return 0;
     }
   }
 
+  // [[ZH]] 功能：两侧环绕数是否都已回到 0（即无任何边界张开）。
+  // [[ZH]] 用途：引擎据此识别"整段处理无变化"的区间，走 skip_n 优化路径。
   virtual bool is_reset () const
   {
     return (m_wc_n == 0 && m_wc_s == 0);
   }
 
 private:
+  // [[ZH]] m_wc_n / m_wc_s：扫描线**上方 / 下方**的有向环绕数（winding number）。
+  // [[ZH]]                  可为负（取决于边的绕行方向）。
+  // [[ZH]] m_function      ：内外判定谓词。决定"什么算内部"，是本类唯一的可替换策略。
   int m_wc_n, m_wc_s;
   F m_function;
 };
@@ -839,6 +997,12 @@ public:
  *    mode == n: wc >= n
  *    mode == -n: wc >= n || wc <= -n
  */
+// [[ZH]] 功能：最常用的融合评估器 —— GenericMerge + ParametrizedInsideFunc 的具名特化。
+// [[ZH]]       等价于"用 mode 指定内外规则、把所有输入边合起来算一个总环绕数"。
+// [[ZH]] 参数：模板已固定为 ParametrizedInsideFunc，无额外模板参数。
+// [[ZH]] 用途：EdgeProcessor::simple_merge() 内部用的就是它。
+// [[ZH]] 注意：本类**没有新增任何成员或方法**，纯粹是给模板取个好用的名字，
+// [[ZH]]       因此行为完全由 GenericMerge + ParametrizedInsideFunc 决定。
 class DB_PUBLIC SimpleMerge
   : public GenericMerge<ParametrizedInsideFunc>
 {
@@ -846,6 +1010,10 @@ public:
   /**
    *  @brief Constructor
    */
+  // [[ZH]] 功能：构造。mode 决定内外规则（见 ParametrizedInsideFunc 的语义表）。
+  // [[ZH]] 参数：mode 默认 -1 = **非零环绕规则**（最常用）。
+  // [[ZH]]             0 = 奇偶规则（可正确处理自相交）；
+  // [[ZH]]             +n = 至少 n 圈才算内部；-n = |wc| >= n。
   SimpleMerge (int mode = -1)
     : GenericMerge<ParametrizedInsideFunc> (ParametrizedInsideFunc (mode))
   { }
@@ -999,6 +1167,27 @@ private:
  *  This operator is especially useful to implement boolean operations
  *  with sized polygons which required a >0 interpretation.
  */
+// [[ZH-BEGIN]]
+// 功能：BooleanOp 的增强版 —— 允许为 A、B 两个操作数**分别**指定融合模式。
+//
+// 【与 BooleanOp 的唯一区别】
+//   BooleanOp  用固定的 NonZeroInsideFunc（非零环绕规则）解释两侧的环绕数。
+//   BooleanOp2 额外接收 wc_mode_a / wc_mode_b，改用 ParametrizedInsideFunc，
+//               因此可以对 A 和 B 采用**不同**的内外规则。
+//
+// 参数：wc_mode_a / wc_mode_b 的语义与 SimpleMerge 的 mode 完全一致
+//       （见 ParametrizedInsideFunc 的语义表）：
+//         -1 = 非零环绕规则（默认）；0 = 奇偶规则；+n = 至少 n 圈；-n = |wc| >= n。
+//
+// 【典型用途（上游文档特别指出的场景）】
+//   对**已经做过 sizing（尺寸缩放）的多边形**做布尔运算时，
+//   缩放会在图形上产生自相交的重叠圈，此时必须用 mode > 0 的"重叠计数"解释，
+//   否则自相交区域会被非零规则误判为内部。
+//
+// 实例参考：单元测试 TEST(27) 用 BooleanOp2(Xor, -1, -1) 把"盒子与其内缩副本"
+//           的异或结果从 4 个角上的碎片合并为 1 个带孔多边形 ——
+//           这是理解 wc_mode_a/b 作用的最佳示例。
+// [[ZH-END]]
 class DB_PUBLIC BooleanOp2
   : public BooleanOp
 {
@@ -1065,13 +1254,41 @@ public:
   // [[ZH]]       （实际判定为 wc > min_overlap，即"多于 min_overlap 个多边形重叠处才输出"）。
   MergeOp (unsigned int min_overlap = 0);
 
+  // [[ZH]] 功能：清空所有计数，回到确定初始状态。
+  // [[ZH]] 修改：m_wcv_n/m_wcv_s 全部置 0；m_wc_n/m_wc_s 置 0；m_zeroes 置为两侧槽位总数。
   virtual void reset ();
+  // [[ZH]] 功能：按 property 总数 n 预分配 m_wcv_n/m_wcv_s（它们以 property 为下标）。
+  // [[ZH]] 参数：n 需覆盖的 property 个数（= 最大 property + 1）。
+  // [[ZH]] 为什么必须：edge() 里有 tl_assert(p < m_wcv_n.size())，未 reserve 就会断言失败。
   virtual void reserve (size_t n);
+  // [[ZH-BEGIN]]
+  // 功能：★ 核心 —— 更新"该 property 的多边形是否张开"，并重算重叠个数，返回状态迁移量。
+  //
+  // 参数：north 选上/下侧；enter ±1；p 边的 property（★ 本类**会用它**，按 property 分开计数）。
+  // 返回：+1 = 重叠判定由假变真；-1 = 由真变假；0 = 无变化。
+  //
+  // 修改：m_wcv_n[p] 或 m_wcv_s[p]（±1）、m_wc_n/m_wc_s（张开个数）、m_zeroes。
+  // 实现细节（见 .cc）：
+  //   · inside_before/after 由"该 property 的 wcv 是否非零"决定，而非由 wcv 的数值决定；
+  //   · 只有 when 该 property 的张开状态**发生变化**时才调整 m_wc（张开个数），
+  //     这样 z 字形的重复穿越不会把同一个多边形数两次。
+  //   · m_zeroes 同步维护，使 is_reset() 成为 O(1)。
+  // [[ZH-END]]
   virtual int edge (bool north, bool enter, property_type p);
+  // [[ZH]] 功能：比较下方与上方的重叠判定之差，供引擎给合成的水平边定方向。
+  // [[ZH]] 实现：result_by_mode(m_wc_n, m_min_wc) - result_by_mode(m_wc_s, m_min_wc)。
   virtual int compare_ns () const;
+  // [[ZH]] 功能：是否所有 property 槽位都已归零（即该处无任何多边形重叠）。
+  // [[ZH]] 实现：比较 m_zeroes（零槽位计数）与两侧槽位总数之和 —— O(1)，无需遍历。
   virtual bool is_reset () const { return m_zeroes == m_wcv_n.size () + m_wcv_s.size (); }
 
 private:
+  // [[ZH]] m_wc_n / m_wc_s：★ 当前张开的（重叠的）**多边形个数**，非环绕数。见类注释。
+  // [[ZH]]                 判定为 (m_wc > m_min_wc)，故 min_wc=0 表示"至少 1 个"。
+  // [[ZH]] m_wcv_n/m_wcv_s：**每个 property 各自的**环绕数 —— 非零即表示该多边形"张开"。
+  // [[ZH]]                  以 property 为下标，故必须先 reserve(n_props)，否则断言失败。
+  // [[ZH]] m_min_wc        ：构造时给定的最小重叠阈值；实际判定是 wc > m_min_wc（严格大于）。
+  // [[ZH]] m_zeroes        ：两侧 m_wcv 中仍为零的槽位数；用于 O(1) 判断 is_reset()。
   int m_wc_n, m_wc_s;
   std::vector <int> m_wcv_n, m_wcv_s;
   unsigned int m_min_wc;
@@ -1403,6 +1620,28 @@ public:
    *  @param out The output edges
    *  @param mode The merge mode (see SimpleMerge constructor)
    */
+  // [[ZH-BEGIN]]
+  // 功能：★ simple_merge（多边形 → **边**）—— 「插入 + 选评估器 + 选 sink + 处理」一次性打包。
+  //       内部等价于：insert 所有输入多边形 → SimpleMerge(mode) → EdgeContainer → process。
+  //
+  // 参数：in   输入多边形列表；
+  //       out  输出边列表（★ 会被清空后写入）；
+  //       mode 融合模式，默认 -1 = 非零环绕规则（语义见 ParametrizedInsideFunc 的语义表）。
+  //
+  // ★ 与 merge() 的区别（上游文档特别说明，值得记住）：
+  //   simple_merge : 把所有多边形**合在一起**算一个总环绕数。
+  //                  → 反向绕行的多边形可能与其它多边形"相互抵消"。
+  //                  → 更快、更省内存。
+  //   merge        : 每个多边形**先各自归一化**（只看它自己是否张开）再融合。
+  //                  → 结果更符合直觉，不会因绕行方向而抵消；代价是更慢/更费内存。
+  //
+  // 输出约定：结果是**闭合轮廓**的边集合，且方向有语义 ——
+  //           外轮廓(hull) 顺时针，孔洞(hole) 逆时针。
+  //           这个约定正是「边的右侧 = 内部」在后处理上的体现，
+  //           也是 PolygonGenerator 能正确缝合出孔洞的依据。
+  //
+  // 坑：输出是**边**。想直接得到多边形，用下面返回 vector<Polygon> 的重载。
+  // [[ZH-END]]
   void simple_merge (const std::vector<db::Polygon> &in, std::vector <db::Edge> &out, int mode = -1);
 
   /**
@@ -1424,6 +1663,22 @@ public:
    *  @param min_coherence true, if touching corners should be resolved into less connected contours
    *  @param mode The merge mode (see SimpleMerge constructor)
    */
+  // [[ZH-BEGIN]]
+  // 功能：simple_merge 的**多边形输出**版本 —— 结果直接缝合成 db::Polygon。
+  //
+  // 相比输出边的版本，多了两个只对"多边形缝合"有意义的参数：
+  //   resolve_holes  true（默认）= 把孔洞"并入"外轮廓，即把带孔多边形拆成
+  //                  **简单（无孔）多边形**。false = 保留孔洞（结果为带孔多边形）。
+  //   min_coherence  true（默认）= 把"仅角点相接"的轮廓拆成更少连接的独立轮廓，
+  //                  避免生成在单点相连的退化多边形。
+  //
+  // 参数：in 输入多边形；out 输出多边形；
+  //       resolve_holes / min_coherence 见上；mode 见 SimpleMerge 构造。
+  //
+  // 实现提示：内部用 PolygonGenerator（见 dbPolygonGenerators.h）做缝合。
+  // 坑：这两个开关只影响**结果的表达方式**（是否带孔、是否在角点分开），
+  //     不影响所表示的几何区域。
+  // [[ZH-END]]
   void simple_merge (const std::vector<db::Polygon> &in, std::vector <db::Polygon> &out, bool resolve_holes = true, bool min_coherence = true, int mode = -1);
 
   /**
@@ -1442,6 +1697,10 @@ public:
    *  @param out The output edges
    *  @param mode The merge mode (see SimpleMerge constructor)
    */
+  // [[ZH]] 功能：simple_merge 的**边输入**版本（边 → 边）。
+  // [[ZH]] ★ 前提：输入的边必须构成**合法的闭合轮廓**（本函数不做闭合性校验）。
+  // [[ZH]] 绕行方向相反的两组轮廓会**相互抵消**；方向相同的重叠轮廓会被合并。
+  // [[ZH]] 输出方向约定同上：外轮廓顺时针、孔洞逆时针。
   void simple_merge (const std::vector<db::Edge> &in, std::vector <db::Edge> &out, int mode = -1);
 
   /**
@@ -1461,6 +1720,9 @@ public:
    *  @param min_coherence true, if touching corners should be resolved into less connected contours
    *  @param mode The merge mode (see SimpleMerge constructor)
    */
+  // [[ZH]] 功能：simple_merge 的**边输入 + 多边形输出**版本（闭合轮廓直接缝成多边形）。
+  // [[ZH]] 参数含义同上面两个重载（输入为边，可选缝合开关 + mode）。
+  // [[ZH]] 前提：输入边必须构成合法闭合轮廓。
   void simple_merge (const std::vector<db::Edge> &in, std::vector <db::Polygon> &out, bool resolve_holes = true, bool min_coherence = true, int mode = -1);
 
   /**
@@ -1482,6 +1744,25 @@ public:
    *  @param out The output edges
    *  @param min_wc The minimum wrap count for output (0: all polygons, 1: at least two overlapping)
    */
+  // [[ZH-BEGIN]]
+  // 功能：★ merge（多边形 → 边）—— 每个多边形**先各自归一化**再融合。
+  //
+  // ★ 与 simple_merge 的关键差别（上游文档要点）——
+  //   本函数先对每个多边形**独立消除自重叠**，再做融合，因此：
+  //     · 自相交的多边形不会因自身重叠而撑高环绕数；
+  //     · 孔洞能与外轮廓**正确合并**（simple_merge 不保证）；
+  //     · 可以借助 min_wc **选出重叠区域**（同一层多个多边形的公共部分）——
+  //       这是 simple_merge 做不到的，因为自重叠会污染计数。
+  //   代价：更慢、更占内存。
+  //
+  // 参数：in 输入多边形；out 输出边；
+  //       min_wc 最小重叠数阈值 —— 输出"重叠数 **>** min_wc"的区域。
+  //              ★ 0（默认）= 输出全部多边形；1 = 只输出至少两个多边形重叠处。
+  //              注意判定是严格大于（见 MergeOp），故 min_wc = n 即"至少 n+1 个"。
+  //
+  // 实现提示：内部使用 MergeOp 评估器，它按 property 区分每个多边形
+  //           （给第 i 个多边形分配 property = i）。
+  // [[ZH-END]]
   void merge (const std::vector<db::Polygon> &in, std::vector <db::Edge> &out, unsigned int min_wc = 0);
 
   /**
@@ -1504,6 +1785,18 @@ public:
    *  @param resolve_holes true, if holes should be resolved into the hull
    *  @param min_coherence true, if touching corners should be resolved into less connected contours
    */
+  // [[ZH-BEGIN]]
+  // 功能：★ merge 的**多边形输出**版本（每个多边形先归一化再融合，结果缝合成 Polygon）。
+  //
+  // 参数：in 输入多边形；out 输出多边形；
+  //       min_wc 最小重叠阈值（同上面输出边的版本：输出重叠数 > min_wc 的区域）；
+  //       resolve_holes / min_coherence 仅影响多边形缝合方式，含义同 simple_merge：
+  //         resolve_holes = true  → 孔洞并入外轮廓，输出**简单（无孔）多边形**；
+  //         min_coherence = true  → 把仅角点相接的轮廓拆成更少连接的独立轮廓。
+  //
+  // 用途提示：想"得到同一层上多个多边形的重叠区域"时，用
+  //           merge (in, out, 1) —— 即 min_wc = 1（至少两个多边形重叠处）。
+  // [[ZH-END]]
   void merge (const std::vector<db::Polygon> &in, std::vector <db::Polygon> &out, unsigned int min_wc = 0, bool resolve_holes = true, bool min_coherence = true);
 
   /**
@@ -1528,6 +1821,22 @@ public:
    *  @param out The output edges
    *  @param mode The sizing mode (see db::Polygon for a description)
    */
+  // [[ZH-BEGIN]]
+  // 功能：★ size（尺寸放大/缩小，多边形 → 边）—— 把每个多边形向外扩张或向内收缩。
+  //
+  // 参数：in 输入多边形；dx / dy 各方向的缩放量（★ **各向异性**，可不同）；
+  //       out 输出边；
+  //       mode 尺寸处理模式（默认 2）—— 这是 db::Polygon::sized 的模式，
+  //            **不是** SimpleMerge 的 mode，别搞混。它不在这里解释，
+  //            而是直接透传给 db::SizingPolygonFilter（见 dbPolygonGenerators.h）。
+  //
+  // 语义：dx, dy 为正 → 向外扩张（膨胀）；为负 → 向内收缩（腐蚀）。
+  //       ★ 收缩过多时图形可能**完全消失**（结果为空的边集），这是正常行为，不是错误。
+  //
+  // 实现提示：内部先给每个多边形分配 property = 下标*2（偶数 = 操作数 A），
+  //           再以 BooleanOp::Or 的形式跑一次，从而把重叠的膨胀结果合并起来。
+  //           —— 这就是为什么"多个多边形同时膨胀后重叠处不会重复"。
+  // [[ZH-END]]
   void size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord dy, std::vector <db::Edge> &out, unsigned int mode = 2);
 
   /**
@@ -1554,6 +1863,10 @@ public:
    *  @param resolve_holes true, if holes should be resolved into the hull
    *  @param min_coherence true, if touching corners should be resolved into less connected contours
    */
+  // [[ZH]] 功能：size 的**多边形输出**版本 —— 膨胀/收缩后结果直接缝合成 Polygon。
+  // [[ZH]] 参数：dx/dy 各向缩放量（可不同）；mode 为 db::Polygon::sized 的模式（默认 2）；
+  // [[ZH]]       resolve_holes / min_coherence 含义同 simple_merge，仅影响缝合方式。
+  // [[ZH]] 提示：收缩量过大时输出可能为空 —— 属正常现象（图形被完全蚀掉）。
   void size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord dy, std::vector <db::Polygon> &out, unsigned int mode = 2, bool resolve_holes = true, bool min_coherence = true);
 
   /**
@@ -1566,6 +1879,7 @@ public:
    *  @param out The output edges
    *  @param mode The sizing mode (see db::Polygon for a description)
    */
+  // [[ZH]] 功能：size 的**各向同性**版本（dx == dy == d）—— 对上面的各向异性版本的内联转发。
   void size (const std::vector<db::Polygon> &in, db::Coord d, std::vector <db::Edge> &out, unsigned int mode = 2)
   {
     size (in, d, d, out, mode);
@@ -1603,6 +1917,24 @@ public:
    *  @param out The output edges
    *  @param mode The boolean mode
    */
+  // [[ZH-BEGIN]]
+  // 功能：★ boolean（两个多边形集合的布尔运算，→ 边）。
+  //       真正的"两个不同输入做 与/或/异或/差"的入口（size 只是它的特例）。
+  //
+  // 参数：a、b 两个输入多边形集合；out 输出边；
+  //       mode 布尔运算类型 —— 取 BooleanOp::BoolOp 的值：
+  //             1 = And（交集）   2 = ANotB（A 减 B）   3 = BNotA（B 减 A）
+  //             4 = Xor（对称差）  5 = Or（并集）
+  //             ★ 注意枚举从 1 开始；脚本里名为 ModeAnd/ModeOr/ModeXor/ModeANotB/ModeBNotA。
+  //
+  // ★ property 自动分配（调用者不用管）：本函数会
+  //       把 a 的多边形分配为**偶数** property（0,2,4,...）→ 操作数 A
+  //       把 b 的多边形分配为**奇数** property（1,3,5,...）→ 操作数 B
+  //   因为 BooleanOp 靠 `p % 2` 区分 A/B。
+  //   若你**手工** insert 边并自己填 property，必须遵守同样的奇偶约定。
+  //
+  // 输出约定同 simple_merge：闭合轮廓，外轮廓顺时针、孔洞逆时针。
+  // [[ZH-END]]
   void boolean (const std::vector<db::Polygon> &a, const std::vector<db::Polygon> &b, std::vector <db::Edge> &out, int mode);
 
   /**
@@ -1621,6 +1953,10 @@ public:
    *  @param resolve_holes true, if holes should be resolved into the hull
    *  @param min_coherence true, if touching corners should be resolved into less connected contours
    */
+  // [[ZH]] 功能：boolean 的**多边形输出**版本（a、b 布尔运算后直接缝合成 Polygon）。
+  // [[ZH]] 参数：mode 取 BooleanOp::BoolOp 值（1=And, 2=ANotB, 3=BNotA, 4=Xor, 5=Or）；
+  // [[ZH]]       resolve_holes / min_coherence 含义同 simple_merge，仅影响缝合方式。
+  // [[ZH]] property 的奇偶约定与上面输出边的版本完全相同（a 偶数 / b 奇数），自动分配。
   void boolean (const std::vector<db::Polygon> &a, const std::vector<db::Polygon> &b, std::vector <db::Polygon> &out, int mode, bool resolve_holes = true, bool min_coherence = true);
 
   /**
@@ -1641,6 +1977,20 @@ public:
    *  @param out The output edges
    *  @param mode The boolean mode
    */
+  // [[ZH-BEGIN]]
+  // 功能：boolean 的**边输入**版本（两组闭合轮廓做布尔运算 → 边）。
+  //
+  // 参数：a、b 两组边（★ 各自必须构成合法闭合轮廓）；out 输出边；
+  //       mode 同 BooleanOp::BoolOp（1=And, 2=ANotB, 3=BNotA, 4=Xor, 5=Or）。
+  //
+  // ★ 本版本与多边形版本的 property 分配不同，需要留意：
+  //       边的版本只把 a 整体分配为 property **0**、b 整体分配为 property **1**。
+  //       即它只区分"属于 A 还是 B"，**不再按每个轮廓细分**。
+  //       （多边形版本则是 a→0,2,4... / b→1,3,5...）
+  //   这个差异意味着：若一组内部的多个轮廓发生自重叠，行为会与多边形版本不同。
+  //
+  // 前提：输入边必须闭合 —— 本函数不校验闭合性，非闭合输入会得到无意义结果。
+  // [[ZH-END]]
   void boolean (const std::vector<db::Edge> &a, const std::vector<db::Edge> &b, std::vector <db::Edge> &out, int mode);
 
   /**
@@ -1662,6 +2012,10 @@ public:
    *  @param resolve_holes true, if holes should be resolved into the hull
    *  @param min_coherence true, if touching corners should be resolved into less connected contours
    */
+  // [[ZH]] 功能：boolean 的**边输入 + 多边形输出**版本（两组闭合轮廓运算后缝成多边形）。
+  // [[ZH]] 参数：a、b 为两组边（须闭合）；mode 同 BooleanOp::BoolOp；
+  // [[ZH]]       resolve_holes / min_coherence 仅影响缝合方式。
+  // [[ZH]] property 约定与上面边输入的版本相同：a → 0，b → 1（仅区分 A/B）。
   void boolean (const std::vector<db::Edge> &a, const std::vector<db::Edge> &b, std::vector <db::Polygon> &out, int mode, bool resolve_holes = true, bool min_coherence = true);
 
 private:
@@ -1695,6 +2049,20 @@ private:
 /**
  *  @brief An edge sink feeding into an EdgeProcessor
  */
+// [[ZH-BEGIN]]
+// 功能：适配器 —— 一个把收到的边**重新插入**到另一个 EdgeProcessor 的 EdgeSink。
+//
+// 【用途】把某次运算的输出接成另一次运算的输入。例如需要"先合并、再对合并结果
+//   做布尔运算"时，可以不必先把边收集到 vector 再插入，而是直接串联两个处理器。
+//
+// 【原理】实现 EdgeSink 的投递接口，但 put()/crossing_edge() 的动作不是保存边，
+//   而是调用目标处理器的 insert()。因此它是"流水线的一环"而非"终点"。
+//
+// 参数：构造函数接收目标 EdgeProcessor 的引用（须比本对象活得久）。
+//
+// 注意：转发时**不携带 tag**（put(edge,tag) 的 tag 只影响本对象的过滤/分流，
+//       重新插入时会丢失）。若依赖 tag 传递语义，需另作处理。
+// [[ZH-END]]
 class DB_PUBLIC EdgesToEdgeProcessor
   : public EdgeSink
 {
