@@ -34,6 +34,35 @@ namespace db {
 /**
  *  @brief A deep, polygon-set delegate
  */
+// [[ZH-BEGIN]]
+// 功能：★★ **深层（deep）区域实现** —— 保留 cell 层次，不展开成一个大集合。
+//
+// 【为什么它是本库处理大数据的关键】
+//   版图有层次结构：一个标准单元可能被引用几百万次。
+//   若把它展平，内存会爆；但很多运算**在层次形式上就能完成**，无需展开。
+//   DeepRegion 就是为了这种场景。
+//
+// 【★ 它多持有什么】
+//   看继承列表：`public MutableRegion, public DeepShapeCollectionDelegateBase`
+//   —— 多继承的后者（见 dbShapeCollection.h）带来一个 **db::DeepLayer**，
+//   那是“指向深层数据结构”的句柄（具体存储在 db::DeepShapeStore 里）。
+//   因此 DeepRegion 本身很轻：它只是一个指向深层存储的引用。
+//
+// 【★★ 最重要的限制：并非所有操作都支持】
+//   层次的表达力有限。例如：
+//     · “求面积 / 布尔 / 部分选择”可以层次化完成；
+//     · 而“逐个多边形遍历并修改”必须先展开 ——
+//       此时会先变成 flat 实现，或直接抛出“不支持”的异常。
+//   ★ 实用结论：
+//     · 在 Deep 上操作若报错/失败，**通常不是 bug**，而是该操作需要平铺；
+//       解决办法是先 `flatten ()`（代价是内存）。
+//     · 写性能敏感代码时，应**尽量选用层次友好的操作**，避免隐式平铺。
+//
+// 【与 DeepShapeStore 的关系】
+//   DeepLayer 指向的数据存在 DeepShapeStore 中（详见 dbDeepShapeStore.h）。
+//   因此 DeepRegion 的**生命周期依附于它所属的 store** ——
+//   store 被销毁后，引用它的 DeepRegion 就失效了。
+// [[ZH-END]]
 class DB_PUBLIC DeepRegion
   : public MutableRegion, public DeepShapeCollectionDelegateBase
 {

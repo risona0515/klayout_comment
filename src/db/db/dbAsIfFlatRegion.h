@@ -39,6 +39,42 @@ namespace db {
 /**
  *  @brief Provides default flat implementations
  */
+// [[ZH-BEGIN]]
+// 功能：★★ **“假装平铺”的默认实现层** —— Region 委托体系里最关键的一块复用。
+//
+// 【它解决什么问题（为什么这个类是必要的）】
+//   RegionDelegate 是一个**巨大的纯虚接口**（几百个方法）。
+//   若每个实现都从头写，代码量会爆炸。
+//   而本类提供了一整套**基于“平铺视角”的默认实现**：
+//     它假定“我能按需给出一个平铺的多边形集合”，
+//     于是把所有高级操作（布尔、sizing、面积、比较……）
+//     **都用这个平铺视角实现一遍**。
+//   ★ 结果：新的 Region 实现只需做到两件事——
+//       ① 能回答“怎么把一个范围的多边形逐个给我”（即提供迭代）；
+//       ② 需要时能“展开成真正的平铺集合”。
+//     剩下的几百个方法全部自动获得。
+//
+// 【★★ 这就是名称 “AsIfFlat” 的含义】
+//   “as if flat” = **表现得好像数据是平铺的**。
+//   即使底层是层次结构（Deep）或只是一个版图层的引用（OriginalLayer），
+//   对外仍可按“平铺区域”的方式使用。
+//   ★ 代价：一旦真的用到了需要平铺的操作，就会**触发展开**（内存/时间上升）。
+//     这就是“Deep 下某些操作会变慢/占内存”的根本原因 ——
+//     它们其实是在 AsIfFlatRegion 里被实现成“先展开再算”。
+//
+// 【★ 在继承链中的位置】
+//     RegionDelegate            抽象接口
+//       ├─ AsIfFlatRegion  ★ 本类：提供平铺式的默认实现
+//       │     ├─ MutableRegion      再增加写能力
+//       │     │     ├─ FlatRegion
+//       │     │     └─ DeepRegion
+//       │     └─ OriginalLayerRegion
+//       └─ EmptyRegion            空实现（不走这条路）
+//
+// 【实用启示】
+//   阅读某个 Region 操作时，若 FlatRegion 与 DeepRegion 都没实现它，
+//   那实现**必然在本文件**（且往往是“先 flatten 再算”）。
+// [[ZH-END]]
 class DB_PUBLIC AsIfFlatRegion
   : public RegionDelegate
 {

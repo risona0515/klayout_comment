@@ -41,6 +41,32 @@ typedef generic_shapes_iterator_delegate<db::Polygon> FlatRegionIterator;
 /**
  *  @brief A flat, polygon-set delegate
  */
+// [[ZH-BEGIN]]
+// 功能：★ **平铺（flat）区域实现** —— 把多边形**实际存在本地**并展开成一个大集合。
+//
+// 【它是什么】
+//   这是 Region 最"直接"的实现：内部就是一个多边形集合（可能来自 merge/布尔运算的结果）。
+//   上面提到它继承 MutableRegion → AsIfFlatRegion → RegionDelegate，
+//   因此它支持全部 Region 操作（布尔、sizing、插入、遍历……）。
+//
+// 【★★ 与 DeepRegion 的取舍（决定何时用哪个）】
+//     FlatRegion ：数据**已展开**——
+//                  优点是几乎所有操作都能直接做；
+//                  代价是**内存占用大**（层次被展平，重复图形各存一份）。
+//     DeepRegion ：数据**保留层次**——
+//                  优点是内存小；代价是部分操作做不了（需先平铺）。
+//   ★ 实用影响：
+//     · 对**小数据 / 需要任意运算** → Flat 更省心；
+//     · 对**超大层次版图** → 尽量用 Deep 能做的操作（如面积、布尔），
+//       避免触发展开（否则内存可能爆）。
+//
+// 【典型来源】
+//   很多操作的结果天然是 flat，例如 `region.merge()`、布尔运算的输出、
+//   以及从多边形列表构造的 Region。
+//
+// 提示：本文件开头还有一个 FlatRegionIterator（迭代器委托），
+//   负责把内部存储的多边形逐个交出。
+// [[ZH-END]]
 class DB_PUBLIC FlatRegion
   : public MutableRegion
 {

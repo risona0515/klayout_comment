@@ -37,6 +37,35 @@ class DeepShapeStore;
 /**
  *  @brief An original layerregion based on a RecursiveShapeIterator
  */
+// [[ZH-BEGIN]]
+// 功能：★ **直接基于版图某一层（非拥有数据）的区域实现**。
+//
+// 【上面英文注释的意思】
+//   "An original layer region based on a RecursiveShapeIterator"
+//   即：这个 Region **不存多边形** ——
+//   它只是对**版图中某一层的图形**的一个“视图”，通过
+//   db::RecursiveShapeIterator（见 dbRecursiveShapeIterator.h）**按需遍历**。
+//
+// 【★★ 核心价值：零拷贝】
+//   假设你想对“M1 层”做布尔运算。有两种做法：
+//     · 先把 M1 层的图形全部读进来构造一个 Region（拷贝 / 展开，内存大）；
+//     · 用 OriginalLayerRegion **直接引用那一层**（不拷贝，几乎不占内存）。
+//   后者显然更优 —— 尤其在“只想快速查询/统计某个已有层”时。
+//
+// 【★ 代价与限制（必须知道）】
+//   1) 它是**只读视图**：不能插入新多边形（数据归属 Layout，不归它）。
+//      需要修改时应先展开/拷贝成 FlatRegion。
+//   2) 它的有效性**依附于源 Layout**：
+//      若那个 Layout 或那一层被修改/重建，本对象可能失效或结果不一致。
+//   3) 由于数据是“按需遍历”，某些需要随机访问的操作会较慢或不可用。
+//
+// 【与“代理模式”的类比】
+//   它很像数据库里的**视图 (view)**：看起来像一个 Region，
+//   但底层是引用而非拷贝。这与 db::PolygonRef（引用不拥有，见 dbPolygon.h）
+//   是同一设计思想在不同层次上的体现。
+//
+// 继承：public AsIfFlatRegion —— 因此它对外表现为“平铺区域”（按需展开）。
+// [[ZH-END]]
 class DB_PUBLIC OriginalLayerRegion
   : public AsIfFlatRegion
 {
