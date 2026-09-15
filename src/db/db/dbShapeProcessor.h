@@ -60,6 +60,12 @@ public:
    *  @param clear_shapes If true, the shapes container is cleared on the start event.
    *  @param prop_id The properties ID to assign to all the output shapes (or 0 if no property shall be assigned)
    */
+  // [[ZH]] 功能：把结果多边形直接写入一个 db::Shapes 容器（版图图层上的图形集合）。
+  // [[ZH]] 参数：shapes 目标容器（引用，须比本对象活得久）；
+  // [[ZH]]       clear_shapes 首次 start() 时是否清空 shapes（single-shot，见 start()）；
+  // [[ZH]]       prop_id 给写入的每个图形统一附加的属性 ID（0 = 不附加属性）。
+  // [[ZH]] 理解要点：ShapeGenerator 是 PolygonSink，所以它必须接在
+  // [[ZH]]           PolygonGenerator / TrapezoidGenerator **之后**（先缝成多边形再写入）。
   ShapeGenerator (db::Shapes &shapes, bool clear_shapes = false, db::properties_id_type prop_id = 0)
     : PolygonSink (), mp_shapes (&shapes), m_clear_shapes (clear_shapes), m_prop_id (prop_id)
   { }
@@ -67,6 +73,8 @@ public:
   /**
    *  @brief Sets the properties ID to be used for the next polygon
    */
+  // [[ZH]] 功能：设定接下来写入图形的属性 ID（★ 修改 m_prop_id）。
+  // [[ZH]] 用途：在投递过程中动态切换属性，从而给不同批次的图形打不同标签。
   void set_prop_id (db::properties_id_type prop_id)
   {
     m_prop_id = prop_id;
@@ -75,6 +83,9 @@ public:
   /**
    *  @brief Implementation of the PolygonSink interface
    */
+  // [[ZH]] 功能：★ 把收到的多边形插入目标 Shapes 容器。
+  // [[ZH]] 修改：mp_shapes 指向的容器（追加一个图形）。
+  // [[ZH]] 分支：prop_id 非 0 时用 PolygonWithProperties 携带属性，否则插入裸多边形。
   virtual void put (const db::Polygon &polygon) 
   {
     if (m_prop_id) {
@@ -87,6 +98,8 @@ public:
   /**
    *  @brief Implementation of the PolygonSink interface
    */
+  // [[ZH]] 功能：首次 start() 时按需清空目标容器（single-shot，用完即关标志）。
+  // [[ZH]] 为何不能每次清空：与尺寸过滤器等多帧投递的处理器兼容，见行内英文注释。
   virtual void start () 
   { 
     if (m_clear_shapes) {
@@ -97,6 +110,9 @@ public:
   }
 
 private:
+  // [[ZH]] mp_shapes     ：目标图形容器（外部传入，不拥有）。
+  // [[ZH]] m_clear_shapes：是否在首次 start() 清空（single-shot 标志）。
+  // [[ZH]] m_prop_id     ：给写入图形附带的属性 ID；0 表示不附加。
   db::Shapes *mp_shapes;
   bool m_clear_shapes;
   db::properties_id_type m_prop_id;
@@ -107,6 +123,30 @@ private:
  *
  *  This class implements the EdgeSink interface.
  */
+// [[ZH-BEGIN]]
+// 功能：★ ShapeProcessor 的**输出端** —— 把结果**边**直接写回 db::Shapes 容器。
+//
+// 【为什么需要它 —— 补齐整个闭环】
+//   ShapeProcessor 把 Shape 拆成边交给 EdgeProcessor；
+//   但布尔运算的结果也是**边**，使用者却期望得到**图形**。
+//   本类就是这么座桥：它实现 EdgeSink（收边），每次 put() 就把边插进 Shapes。
+//
+//   ★ 注意它直接插入的是 db::Edge（即结果是"边图形"而不是多边形）：
+//     若希望结果是多边形，需要在中间接 PolygonGenerator 缝合成多边形，
+//     再用 ShapeGenerator（PolygonSink）写入。两条路线的区别：
+//        EdgeProcessor → EdgeShapeGenerator            → Shapes 里是**边**
+//        EdgeProcessor → PolygonGenerator → ShapeGenerator → Shapes 里是**多边形**
+//
+// 【与本文件其它类的配合】
+//   它与 ShapeGenerator 名字很像，区别是接收层次不同：
+//     EdgeShapeGenerator : EdgeSink（收**边**，直接存边）
+//     ShapeGenerator     : PolygonSink（收**多边形**，存多边形）
+//
+// 参数（构造）：shapes 目标容器；clear_shapes 首次 start() 是否清空；
+//               tag 标签过滤（0 = 不限）；chained 链式下游（可选）。
+//
+// 坑：put(edge,tag) 的链式转发**不受标签过滤影响** —— 与 EdgeContainer 行为一致。
+// [[ZH-END]]
 class DB_PUBLIC EdgeShapeGenerator
   : public EdgeSink
 {
@@ -164,6 +204,10 @@ public:
   }
 
 private:
+  // [[ZH]] mp_shapes     ：目标图形容器（外部传入，本类不拥有）。
+  // [[ZH]] m_clear_shapes：是否在首次 start() 清空（single-shot 标志）。
+  // [[ZH]] m_tag         ：只写入该标签的边；0 表示不限。
+  // [[ZH]] mp_chained    ：可选的链式下游边接收端；0 表示无。
   db::Shapes *mp_shapes;
   bool m_clear_shapes;
   int m_tag;
@@ -176,6 +220,45 @@ private:
  *  Similar to the edge processor, this class deals with shape objects and shape containers 
  *  instead of polygons.
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  ShapeProcessor —— 面向「Shape」的边处理器（EdgeProcessor 的前端包装）
+// ============================================================================
+//
+// 【与 EdgeProcessor 的关系（一句话）】
+//   EdgeProcessor 只认「边」；ShapeProcessor 认「版图图形」——
+//   它把 db::Shape（可能是 box / polygon / path / text...）拆成边，喂给内部的
+//   EdgeProcessor，再把结果包装回去。因此它是**面向使用者的便利外观**。
+//
+//        db::Shape / db::Shapes（版图图层上的图形）
+//              ↓ 拆成边               ShapeProcessor  ★ 本类
+//        db::EdgeProcessor（布尔/融合/缩放引擎）
+//              ↓ 输出
+//        EdgeSink / PolygonSink
+//
+// 【★ 为什么需要它 —— 它额外做了 EdgeProcessor 不做的事】
+//   1) **图形类型的归一化**：Shape 可以是 box / polygon / path / text 等，
+//      ShapeProcessor 负责把它们统一转成边（path 要按宽度展开成轮廓，
+//      box 要转成 4 条边）。见 insert(shape, ...) 的各重载。
+//   2) **变换的应用**：insert 时可直接传入变换（db::Trans 等），
+//      在拆边的同时完成坐标变换，避免用户先手工变换再插入。
+//   3) **批量筛选**：可以按图形类型/属性过滤，只插入关心的图形
+//      （见下面的 insert(..., ShapeSelector) 之类重载）。
+//
+// 【组成】
+//   · 内部持有一个 EdgeProcessor（成员 m_processor）—— 所有几何运算都委托给它。
+//     因此 EdgeProcessor 的性能特性（阶段 2 求交最贵、redo 可跳过等）在这里同样适用。
+//   · 同文件还有 EdgeShapeGenerator（实现 EdgeSink），负责**反向**把结果边
+//     写回 db::Shapes 容器 —— 即"输出端"。于是形成完整的闭环。
+//
+// 【与 Python/Ruby API 的对应】
+//   脚本里的 RBA::ShapeProcessor / klayout.db.ShapeProcessor 就是本类，
+//   其绑定文档明确提示 "See the EdgeProcessor for a description" ——
+//   因为两者语义一致，只是输入类型不同。
+//
+// 参数（构造）：report_progress 是否上报进度（有性能代价）；
+//               progress_desc 进度条文字。
+// [[ZH-END]]
 class DB_PUBLIC ShapeProcessor 
 {
 public:
@@ -184,26 +267,36 @@ public:
    *
    *  @param report_progress If true, a tl::Progress object will be created to report any progress (warning: this will impose a performance penalty)
    */
+  // [[ZH]] 功能：构造。内部创建 EdgeProcessor 并转发进度设置；此时没有任何图形。
+  // [[ZH]] 参数：report_progress 是否上报进度（★ 有性能损失，批量运算建议关闭）。
   ShapeProcessor (bool report_progress = false, const std::string &progress_desc = std::string ());
 
   /**
    *  @brief Clear the shapes stored currently
    */
+  // [[ZH]] 功能：清空已插入的图形（转发给内部 EdgeProcessor::clear）。
+  // [[ZH]] 用途：复用同一个对象处理下一批数据时调用。
   void clear ();
 
   /**
    *  @brief Reserve the number of edges
    */
+  // [[ZH]] 功能：预分配容量。参数 n 是**预估的边数**（注意不是图形数）——
+  // [[ZH]]       一个多边形会展开出与顶点数相同的边数，所以 n 通常远大于图形数。
   void reserve (size_t n);
 
   /**
    *  @brief Reports the number of edges stored in the processor
    */
+  // [[ZH]] 功能：返回内部已存储的**边**数量（不是图形数量）。
+  // [[ZH]] 坑：因为是把图形拆成边后计数，所以它通常比插入的图形数大得多；
+  // [[ZH]]     并且零点长的边会在插入时被丢弃（继承 EdgeProcessor 的行为）。
   size_t count () const;
 
   /**
    *  @brief Sets the base verbosity of the processor (see EdgeProcessor::set_base_verbosity for details)
    */
+  // [[ZH]] 功能：设置耗时日志的详细程度阈值（直接转发给内部 EdgeProcessor，含义见彼处）。
   void set_base_verbosity (int bv)
   {
     m_processor.set_base_verbosity (bv);
@@ -214,6 +307,7 @@ public:
    *
    *  @param progress_text The description text of the progress object
    */
+  // [[ZH]] 功能：启用进度上报（转发给内部 EdgeProcessor）。
   void enable_progress (const std::string &progress_desc = std::string ())
   {
     m_processor.enable_progress (progress_desc);
@@ -222,6 +316,7 @@ public:
   /**
    *  @brief Disable progress
    */
+  // [[ZH]] 功能：关闭进度上报（转发给内部 EdgeProcessor）。
   void disable_progress ()
   {
     m_processor.disable_progress ();
@@ -230,6 +325,8 @@ public:
   /**
    *  @brief Insert a shape without transformation
    */
+  // [[ZH]] 功能：插入一个图形（无坐标变换）。等价于用单位变换调用带变换的版本。
+  // [[ZH]] 参数：shape 待插入图形；p 来源标签（见 EdgeProcessor 文件头的 property 说明）。
   void insert (const db::Shape &shape, db::EdgeProcessor::property_type p)
   {
     insert (shape, db::UnitTrans (), p);
