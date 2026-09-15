@@ -278,17 +278,29 @@ def check_insertion_context(path, lines, mask):
         # 刻意不处理引号：判断错只会漏报，属于安全方向。
         code = line.split("//")[0] if '"' not in line.split("//")[0] else line
 
-        # Toggle raw-string state.  Only handles the R"( ... )" form.
-        # 切换原始字符串状态，只处理 R"( ... )" 形式。
-        if 'R"' in code:
-            in_raw_string = not in_raw_string
+        # Toggle raw-string state.  Only the real raw-string syntax `R"(` (and the
+        # `R"delim(` form) opens one.  Matching a bare `R"` is wrong: prose such as
+        # `"R" is the type ...` in a doc comment contains it and would latch
+        # in_raw_string on for the rest of the file, producing false positives.
+        # 切换原始字符串状态。只有真正的原始字符串语法 `R"(`（以及 `R"delim(` 形式）
+        # 才会开启它。只匹配 `R"` 是错的：文档注释里的 `"R" is the type ...` 这类文字
+        # 含有它，会把 in_raw_string 一直误置为真，导致后续全是误报。
+        if not in_block_comment and 'R"' in code:
+            rpos = code.find('R"')
+            # The char after R"( or R"<delim>( must be '(' eventually; accept the
+            # common `R"(` and `R"xxx(` shapes.
+            rest = code[rpos + 2:]
+            if rest.startswith("(") or ("(" in rest.split(")")[0]
+                                        and rest[:rest.find("(")].replace("-", "").isalnum()):
+                in_raw_string = not in_raw_string
 
         # Track block comments, ignoring one-line /* ... */ pairs.
         # 跟踪块注释，忽略单行 /* ... */ 对。
-        if "/*" in code and "*/" not in code:
-            in_block_comment = True
-        elif "*/" in code:
-            in_block_comment = False
+        if not in_raw_string:
+            if "/*" in code and "*/" not in code:
+                in_block_comment = True
+            elif "*/" in code:
+                in_block_comment = False
 
     return problems
 

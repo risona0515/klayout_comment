@@ -55,6 +55,41 @@ inline int64_t box_world_min<int64_t> () { return -(int64_t (1) << 53); }
 template <>
 inline int64_t box_world_max<int64_t> () { return (int64_t (1) << 53); }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbBox.h —— 轴对齐矩形（bounding box / 包围盒）
+// ============================================================================
+//
+// 【位置】几何三剑客的最后一块：point（位置）、vector（位移）、box（矩形范围）。
+//   它是全库最常用的“范围”表示：
+//     · 每个图形都有 bbox()，用于快速排除不相交的图形；
+//     · 层次结构（Cell）有 bbox_cache，用于快速剪枝；
+//     · 扫描线算法用它做“分格剪枝”（见 dbEdgeProcessor.cc 的 cell）。
+//
+// 【★ 约定：p1 是左下角，p2 是右上角】
+//   注意与直觉的差异：p1 **不一定是**你传入的第一个点 ——
+//   构造函数会**自动排序**（见下），保证 p1 是左下、p2 是右上。
+//   所以 box 总是“规范化的”，没有“倒置的 box”这种状态。
+//
+// 【★★ 空 box（empty box）—— 本类最重要的概念，容易踩坑】
+//   空 box 表示“完全没有区域”（连一个点都没有），而**不是**“面积为零的矩形”。
+//   实现方式很巧妙：默认构造把 p1 设为 (1,1)、p2 设为 (-1,-1) ——
+//   即让 p1 > p2，于是 empty() 就退化成一次比值。
+//   ★ 由此产生一个必须记住的区别：
+//       · 空 box           → 不包含任何点，empty() == true
+//       · 点 box（p1==p2）→ 面积为 0，**仍可包含一个点**，empty() == false
+//       · 线 box（宽或高为 0）→ 面积为 0，仍可包含点、仍能相交，empty() == false
+//   把“面积为零”当成“空”是常见错误 —— 两者不相等。
+//
+// 【模板参数 C 与 R 的区别（容易看漏）】
+//     C = 坐标的**运算/对外类型**（如 int，用于计算）
+//     R = 坐标的**实际存储类型**（如 short，用于省内存）
+//   两者可不同：box<int, short> 对外表现为 int 坐标，但内部用 short 存，
+//   以减小内存占用（大量小 box 时效果明显）。若不需要省内存，R == C。
+//   典型写法见 db::Box（R == C）与 db::ShortBox（R 更窄）。
+//
+// 上面英文文档也提到了“box 可以是点或线，面积为 0 但仍可重叠”—— 与之对应。
+// [[ZH-END]]
 /**
  *  @brief A box class
  *
@@ -74,6 +109,9 @@ inline int64_t box_world_max<int64_t> () { return (int64_t (1) << 53); }
 template <class C, class R>
 struct DB_PUBLIC_TEMPLATE box
 {
+  // [[ZH]] 配套类型别名（与 point/vector/edge 同一模式）：
+  // [[ZH]] coord_type → 对外坐标类型 C；box_type → 自身的 box 类型
+  // [[ZH]] area_type / distance_type / perimeter_type → 更宽的运算类型（防溢出）
   typedef C coord_type;
   typedef box<C, R> box_type;
   typedef point<C> point_type;
@@ -86,6 +124,19 @@ struct DB_PUBLIC_TEMPLATE box
   /**
    *  @brief Empty box constructor
    */
+  // [[ZH-BEGIN]]
+  // 功能：构造**空 box**。
+  //
+  // ★ 实现手法值得一看：p1 = (1,1)、p2 = (-1,-1)，即故意让 p1 > p2。
+  //   这样所有几何判断（empty/contains/intersection...）都能统一用一个
+  //   “p1 <= p2” 的比值来判定，无需额外的“空”标志位。
+  //   代价：空 box 的坐标看着奇怪（左下角在右上角的右上方），
+  //         但这是**内部表示**，不应直接解读其坐标。
+  //
+  // 坑：默认构造函数产生的是**空 box**，不是 (0,0)-(0,0) 的矩形！
+  //     若要“从零开始的矩形”，请显式写 box (0,0,0,0) 或 box (db::Point(), db::Point())。
+  //     很多“为什么我的 box 什么都没包含”的困惑都源于这一点。
+  // [[ZH-END]]
   box ()
     : m_p1 (1, 1), m_p2 (-1, -1)
   {
@@ -104,6 +155,10 @@ struct DB_PUBLIC_TEMPLATE box
    *  @param x2 The second x coordinate
    *  @param y2 The second y coordinate
    */
+  // [[ZH]] 功能：用四个坐标构造，并**自动排序**（不信赖调用者给出正确的左右/上下顺序）。
+  // [[ZH]] 参数：x1,y1 第一个角；x2,y2 对角。顺序任意 —— 函数内部用 min/max 归一化。
+  // [[ZH]] 结果保证：m_p1 = 左下（两维取小），m_p2 = 右上（两维取大）。
+  // [[ZH]] 提示：因此构造出的 box 永远是“规范化”的，无需担心倒置。
   box (C x1, C y1, C x2, C y2)
     : m_p1 (x1 < x2 ? x1 : x2, y1 < y2 ? y1 : y2), 
       m_p2 (x2 > x1 ? x2 : x1, y2 > y1 ? y2 : y1)
@@ -147,6 +202,21 @@ struct DB_PUBLIC_TEMPLATE box
    *
    *  Hint: this box is likely to be somewhat misfunctional. It cannot be transformed well for example.
    */
+  // [[ZH-BEGIN]]
+  // 功能：返回覆盖整个坐标范围的“世界 box”（极左/极下 到 极右/极上）。
+  //
+  // ★ 用途：“从无到有”地累积出一个包围盒的惯用起点 ——
+  //   从一个空 box 开始逐个 joined() 也行，但 world() 更适合“求所有图形的总范围”。
+  //
+  // ⚠ 上游自己提醒（见英文 Hint）：这个 box “有点不好用”，例如它无法被良好地变换
+  //   （因为坐标已达类型极限，平移/缩放会溢出）。
+  //   因此：
+  //     · 适合作为**比较/累积的初始值**（求交、求包含关系）；
+  //     · 不适合参与**变换/运算**后再期待正确结果。
+  //
+  // 实现：用 box_world_min<C>() / box_world_max<C>() 给出该坐标类型的极值
+  //   （对 int64 还刻意限制在 2^53 以内，以避开浮点表示精度问题）。
+  // [[ZH-END]]
   static box world () 
   {
     return box (box_world_min<C> (), box_world_min<C> (), box_world_max<C> (), box_world_max<C> ());
@@ -665,6 +735,20 @@ struct DB_PUBLIC_TEMPLATE box
 
 
 private:
+  // [[ZH-BEGIN]]
+  // 这是 box 的**全部**数据成员 —— 两个角点，没有额外的“空”标志位。
+  //
+  // m_p1 : 左下角（lower left）—— 约定 p1.x() <= p2.x() 且 p1.y() <= p2.y()
+  // m_p2 : 右上角（upper right）
+  //
+  // ★ 重要含义：
+  //   1) “空 box”不是靠标志位表示的，而是靠 p1 > p2 ——
+  //      因此 empty() 只是一次比较，无额外存储开销。
+  //      副作用：空 box 的坐标值看起来“反了”，这是刻意的内部表示。
+  //   2) 类型 R 是**存储**类型（可能与对外类型 C 不同）——
+  //      这就是上面提到的“用 short 存、用 int 算”的省内存手段。
+  //   3) 纯值类型：拷贝廉价，与 point/vector 一样。
+  // [[ZH-END]]
   point<R> m_p1, m_p2;
 };
 
