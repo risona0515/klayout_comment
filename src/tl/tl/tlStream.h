@@ -386,6 +386,45 @@ private:
  *  This object provides unget capabilities and buffering.
  *  The actual stream access is delegated to another object.
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  tlStream.h —— 流 I/O 抽象（读写的统一底座）
+// ============================================================================
+//
+// 【本文件解决的三个问题】
+//
+//   1) **“数据源的多样性”** —— InputFile / InputPipe / InputZLibFile ...
+//      同一份读取代码要能读普通文件、管道、压缩文件、内存缓冲。
+//      做法：**委托模式**（与 db 层的 Region/Library 同一手法）——
+//        InputStreamBase        ← 抽象接口（read block / seek / 关流 ...）
+//          ├─ InputFile         普通文件
+//          ├─ InputPipe         管道
+//          └─ InputZLibFile     压缩文件（读入时自动解压）
+//      ★ 因此 db::Reader 只依赖 InputStream，**不关心压缩与否** ——
+//        这就是“为什么 KLayout 能直接读 .gz 而不必先解压”的机制。
+//
+//   2) **缓冲与回退 (buffering / unget)** —— 上面英文注释明确点到了这两点：
+//        “This object provides unget capabilities and buffering.”
+//      ★ **unget（回退）非常关键**：格式探测需要“先读几个字节看看像什么格式，
+//        若不像就退回去”。没有回退能力，就得把整个流缓存或重开 ——
+//        这正是 db::Reader 构造时能自动探测格式的基础。
+//        见 dbReader.h 里“构造函数会探测格式”的说明。
+//
+//   3) **源信息（source / path / filename）** —— 见 InputStreamBase 上的
+//      get_source / absolute_path / filename 等方法。
+//      ★ 用途：错误信息里给人看“是哪个文件出的错”，
+//        以及“按扩展名猜格式”这类辅助判断。
+//
+// 【★ 与 db 层的衔接】
+//   db::Reader (InputStream &s)  ← 直接接本类的输入流
+//   db::Writer (OutputStream &s) ← 直接接对应的输出流
+//   因此整个 I/O 栈是：db 格式插件 → db::Reader/Writer → tl 流 → 具体来源。
+//   ★ 这也解释了“为什么 db 的 I/O 不直接接文件名”：文件名只是流的**一种**来源。
+//
+// 【本文件其余内容】
+//   OutputStreamBase / OutputFile / OutputPipe / OutputZLibFile  —— 写出侧（对称）
+//   InputStream / OutputStream                                   —— 使用者直接用的类
+// [[ZH-END]]
 
 class TL_PUBLIC InputStream
 {
@@ -1248,9 +1287,34 @@ private:
 class TL_PUBLIC OutputStream
 {
 public:
+  // [[ZH-BEGIN]]
+  // 功能：★ **输出流** —— 与 InputStream 对称的写出侧门面。
+  //
+  // 【与 InputStream 的一一对应关系】
+  //     InputStream  ← 读（InputFile / InputPipe / InputZLibFile）
+  //     OutputStream ← 写（OutputFile / OutputPipe / OutputZLibFile）★ 本类
+  //   具体目标由**委托**决定，因此调用方只依赖 OutputStream，
+  //   **不关心是写文件、写管道还是写压缩文件**。
+  //   ★ 实用含义：db::Writer 接的是输出流，所以“另存为 .gz”
+  //     不需要改 Writer 一行代码 —— 只换一个 OutputStream 实现。
+  //
+  // 【与读取侧的三点差异】
+  //   1) 写出**通常不需要“探测”**（见 dbWriter.h：写必须显式指定格式），
+  //      因此本类没有 unget 这类回退能力 —— 它只需顺序写出。
+  //   2) 写出涉及**压缩级别等选项**（见下面的 OutputStreamMode 枚举）。
+  //   3) **关闭/析构时机更要紧**：缓冲未刷新会导致内容未落盘。
+  //      ★ 因此使用上应确保 OutputStream 在写出完成后及时销毁（或显式刷新）。
+  //
+  // 【与 db 层的衔接】
+  //     db::Writer (OutputStream &s, ...)   ← 直接接本类
+  //   完整栈：db 格式插件 → db::Writer → tl::OutputStream → 具体目标。
+  // [[ZH-END]]
   /**
    *  @brief Definitions of the output options
    */
+  // [[ZH]] 功能：输出模式的选项枚举 —— 例如是否压缩（及其实现方式）。
+  // [[ZH]] 用途：构造 OutputStream 时选择，决定底层用哪个委托实现。
+  // [[ZH]] 提示：具体取值见枚举内注释；这是“同一 API、多种后端”的又一体现。
   enum OutputStreamMode
   {
     /**
