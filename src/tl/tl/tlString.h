@@ -482,6 +482,57 @@ inline std::string db_to_string (int64_t d)
  *  The stream in general consumes white spaces.
  *  It is possible to customize the extractor by overloading the error method for example.
  */
+// [[ZH-BEGIN]]
+// 功能：★★ **通用解析器（extractor）** —— 全库“从文本读值”的统一入口。
+//
+// 【它是什么（上面英文注释的展开）】
+//   把它理解成“一个**值的扫描器**”：
+//     · 用一串字符初始化（通常是待解析的文本）；
+//     · 然后逐个元素地取出值（read / try_read）；
+//     · 默认会**跳过空白**；
+//     · 解析出错时可通过重载 error () 自定义错误处理。
+//
+// 【★★ 本类是我们在多处反复“写特化”的那套机制的本体】
+//   回看前面几个文件，它们都在为 tl 命名空间下的两个函数写特化：
+//     dbPoint.cc / dbEdge.cc / dbEdgePairs.cc / dbTrans.cc / dbText.cc
+//   那些特化让**库中的几何/变换/文本类型可以被本类解析**，例如：
+//       \"100,200\"            → db::Point
+//       \"(x1,y1;x2,y2)\"      → db::Edge
+//       \"e1/e2\" 或 \"e1|e2\"   → db::EdgePair（斜杠=有向，竖线=对称）
+//       \"r90 100,200\"        → db::Trans
+//       \"(\\\"VDD\\\",r0 10,20)\"  → db::Text
+//   ★ 所以本类是“文本 → 任意库类型”这条链的**中央枢纽**。
+//     要添加新的可解析类型，就是为 extractor_impl / test_extractor_impl
+//     再写一个特化（见 tlString.h 顶部的默认模板）。
+//
+// 【★★ 三个必须掌握的能力（决定了很多设计）】
+//   1) **read vs try_read**：
+//        read      —— **强制**读；失败则报错（调用 error ()）。
+//        try_read  —— **试探**读；失败返回 false，**不报错**。
+//      ★ 这一对正是我们在各处写两个特化的原因（一个强制、一个试探）。
+//   2) **回退（可保存/恢复状态）**：
+//      解析器可被**拷贝保存**，失败时把保存的副本赋回去即可完全回退。
+//      ★ dbEdgePair.cc 里的 std::nothrow 模式（`ex_saved = ex; ... ex = ex_saved;`）
+//        就是**正确用法**的范例；而 dbPoint.cc 里上游自己标了 TODO，
+//        说它的试探“并不是真的试探”（因为缺回退）。
+//   3) **expect / test**：
+//        expect(s)  —— 要求下一个 token 恰好是 s，否则报错（用于固定语法，
+//                      如边的分号、路径的括号）；
+//        test(s)    —— 若下一个 token 是 s 则消费并返回 true，否则不动。
+//      ★ 用法区别：语法**必须**出现的用 expect，**可选**的用 test。
+//
+// 【★ 典型使用位置（为什么整库都要它）】
+//   · 脚本参数解析（Ruby/Python 传入的字符串参数）；
+//   · 文本类文件格式（DXF/Gerber 等）的字段解析；
+//   · 配置/属性字符串（如层映射、PCell 参数的文本形式）；
+//   · 单元测试里直接解析期望值。
+//   ★ 共同点：**格式是文本，但要变成强类型的库对象** —— 这正是本类的职责。
+//
+// 【与 tl::Variant 的配合】
+//   Extractor 也能解析出 Variant（任意值），因此“文本 → 任意值”链路完整：
+//       text --Extractor--> Variant / Point / Edge / Trans / ...
+//    与 tlVariant.h 里“值 → 文本”的反向链配合，构成完整的**往返能力**。
+// [[ZH-END]]
 class TL_PUBLIC Extractor
 {
 public:
