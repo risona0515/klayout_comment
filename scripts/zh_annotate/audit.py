@@ -104,6 +104,14 @@ def annotated_files(root, ref):
 
     Our own tooling is excluded: it mentions the marker token by design.
     我们自己的工具脚本被排除：它们按设计就会提到该标记记号。
+
+    NOTE: the test is for the common prefix "[[ZH", not the literal "[[ZH]]".
+    A file annotated only with block markers contains "[[ZH-BEGIN]]" and
+    "[[ZH-END]]" but not the bare token, so matching the full token would
+    under-count such files (it did, before this fix).
+    注意：检测的是公共前缀 "[[ZH"，而不是字面量 "[[ZH]]"。
+    只用块标记的文件含 "[[ZH-BEGIN]]"/"[[ZH-END]]"，不含裸标记，
+    因此用完整标记去匹配会**少算**（修复前就少算了）。
     """
     result = []
     for rel in changed_files(root, ref):
@@ -113,7 +121,7 @@ def annotated_files(root, ref):
         if not os.path.isfile(path):
             continue
         try:
-            if z.MARKER in open(path, encoding="utf-8").read():
+            if "[[ZH" in open(path, encoding="utf-8").read():
                 result.append(rel)
         except (UnicodeDecodeError, OSError):
             pass
