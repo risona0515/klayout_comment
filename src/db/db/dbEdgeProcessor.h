@@ -335,6 +335,28 @@ private:
  *  This receiver simply collects the edges in a container (a vector of edges)
  *  which is either kept internally or supplied from the outside.
  */
+// [[ZH-BEGIN]]
+// 功能：最常用的 EdgeSink 实现 —— 把收到的边简单地收集进一个 std::vector<db::Edge>。
+//
+//       用途：当你只想要"结果边的列表"，不需要缝合成多边形时，直接用它。
+//       典型场景：布尔运算结果还需进一步后处理，或只关心边本身（如 DRC 的边检查）。
+//
+// 【两种存放方式（由构造函数选择）】
+//   · 外部容器：EdgeContainer(vec)      —— 结果直接写进你提供的 vec
+//   · 内部容器：EdgeContainer()         —— 结果存进对象内的 m_edges，用 edges() 取出
+//   外部方式的好处是你能预先 reserve、复用缓冲区。
+//
+// 【两个可选行为参数】
+//   · tag      —— 只收集带指定标签的边（0 表示"标签不限，全收"）
+//   · chained  —— 链式转发：收到的边同时也投递给另一个 EdgeContainer
+//                 （用于"既要汇总、又要分流"的场景）
+//
+// 坑：1) clear 参数只在**构造函数**里生效，而且实现上是在第一次 start() 时清空一次
+//        然后立刻把标志清零（见 start() 里的注释）——这是为了兼容"多次 start/flush"的
+//        分帧投递（例如尺寸过滤器），不会把后续帧的数据误清。
+//     2) 本类**不做去重、不排序、不缝合**：它按引擎投递的原样顺序追加，
+//        因此可能包含未闭合的边序列。想得到闭合多边形请用 PolygonGenerator。
+// [[ZH-END]]
 class DB_PUBLIC EdgeContainer 
   : public EdgeSink
 {
@@ -342,6 +364,11 @@ public:
   /**
    *  @brief Constructor connecting this receiver to an external edge vector
    */
+  // [[ZH]] 功能：把本容器绑定到**外部**的边数组上，结果直接追加进 `edges`。
+  // [[ZH]] 参数：edges 外部容器（引用，须比本对象活得久）；
+  // [[ZH]]       clear 首次 start() 时是否先清空 edges；
+  // [[ZH]]       tag   只收集该标签的边，0 = 不限；
+  // [[ZH]]       chained 同时把边转发给这个链式容器（可为空）。
   EdgeContainer (std::vector<db::Edge> &edges, bool clear = false, int tag = 0, EdgeContainer *chained = 0)
     : EdgeSink (), mp_edges (&edges), m_clear (clear), m_tag (tag), mp_chained (chained)
   { }
@@ -349,6 +376,7 @@ public:
   /**
    *  @brief Constructor using an internal edge vector
    */
+  // [[ZH]] 功能：不提供外部容器，结果存进对象自带的内部数组，用 edges() 读取。
   EdgeContainer (int tag = 0, EdgeContainer *chained = 0)
     : EdgeSink (), mp_edges (&m_edges), m_clear (false), m_tag (tag), mp_chained (chained)
   { }
@@ -836,6 +864,27 @@ class DB_PUBLIC BooleanOp
   : public EdgeEvaluatorBase 
 {
 public:
+  // [[ZH-BEGIN]]
+  // 功能：五种布尔运算的枚举。★ 注意枚举值从 1 开始（不是 0），
+  //       且这些数值会被直接当作 int mode 传给 boolean() 便捷函数。
+  //          And   = 1   交集             A ∩ B
+  //          ANotB = 2   A 减去 B         A \ B
+  //          BNotA = 3   B 减去 A         B \ A
+  //          Xor   = 4   对称差（异或）    A △ B
+  //          Or    = 5   并集             A ∪ B
+  //
+  // ★ 输入属性(property)的约定 —— 用布尔运算前必须遵守，否则结果错误：
+  //   评估器靠 `p % 2`（最低位）区分这条边属于哪个操作数：
+  //        偶数 property → 操作数 A
+  //        奇数 property → 操作数 B
+  //   因此：
+  //     · boolean() 的多边形版本会自动分配 A = 0,2,4,...  B = 1,3,5,...
+  //     · 若你自己 insert 边并手工填 property，务必保持这个奇偶约定。
+  //   高位（除 bit0 外）用于区分同一操作数内的不同多边形（各自独立算环绕数，
+  //   从而让"同一个操作数内部的多个多边形"先各自归一化再参与布尔运算）。
+  //
+  // 提示：脚本里这些常量暴露为 ModeAnd / ModeOr / ModeXor / ModeANotB / ModeBNotA。
+  // [[ZH-END]]
   enum BoolOp {
     And = 1, ANotB = 2, BNotA = 3, Xor = 4, Or = 5
   };
@@ -845,6 +894,7 @@ public:
    *
    *  @param mode The boolean operation that this object represents
    */
+  // [[ZH]] 功能：用指定的布尔运算类型构造评估器。mode 取值见上面的 BoolOp 枚举。
   BooleanOp (BoolOp mode);
 
   virtual void reset ();
@@ -883,6 +933,20 @@ public:
   /**
    * @brief The operation mode
    */
+  // [[ZH-BEGIN]]
+  // 功能：选择"挑出哪些边"的模式。
+  //         Inside  = 0  挑出位于多边形**内部**的边
+  //         Outside = 1  挑出位于多边形**外部**的边
+  //         Both    = 2  两者都挑，并用**标签(tag)**区分：
+  //                      内部边 → tag #1
+  //                      外部边 → tag #2
+  //       标签通过 sink 的 put(edge, tag) 重载传出，sink 可据此分流。
+  //
+  // ★ 输入约定：多边形自身的边必须用 property = 0，被检查的那些边用 property >= 1。
+  //              评估器靠这个区分"边界"与"待过滤对象"。
+  //
+  // 关于 include_touching：决定"恰好落在多边形边界上"的边算内部还是外部。
+  // [[ZH-END]]
   enum mode_t {
     Inside = 0,    //  Selects inside edges
     Outside = 1,   //  Selects outside edges
@@ -896,6 +960,20 @@ public:
    *  @param include_touching If true, edges on the polygon's border will be considered "inside" of polygons
    *  @param polygon_mode Determines how the polygon edges on property 0 are interpreted (see merge operators)
    */
+  // [[ZH-BEGIN]]
+  // 功能：构造 边-多边形 关系评估器。
+  //
+  // 参数：mode 选择 Inside / Outside / Both，含义见上面 mode_t 的注释。
+  //       include_touching 为 true 时，"恰好落在多边形边界上"的边被视为**内部**。
+  //                        它同时决定 prefer_touch() 的返回值，因此会影响环绕数判定。
+  //       polygon_mode 如何解释 property=0 的多边形边 —— 即用哪种融合规则
+  //                    （语义同 SimpleMerge 的 mode，见 ParametrizedInsideFunc 的语义表）。
+  //                    默认 -1 = 非零环绕规则。可用 0 表示某些"退化/自相交"的多边形按奇偶规则解释。
+  //
+  // ⚠ 上游文档笔误提醒：上面英文 @param 写的是 "outside"（布尔），
+  //   但实际形参是 `mode_t mode`（枚举）—— 属于重构后未更新的残留注释。
+  //   请以函数签名为准。
+  // [[ZH-END]]
   EdgePolygonOp (mode_t mode = Inside, bool include_touching = true, int polygon_mode = -1);
 
   virtual void reset ();
@@ -948,6 +1026,32 @@ private:
  *  merge is equivalent to producing all polygins. A overlap value of 1 means
  *  that at least two polygons must overlap to produce a result.
  */
+// [[ZH-BEGIN]]
+// ⚠ 先看这里，避免和其他 wc 混淆：
+//   本类中的 wc **不是环绕数(winding number)**，而是"**当前张开的（重叠的）多边形个数**"。
+//   它由每个 property 各自的环绕数统计得来：
+//       对某个 property p：  "该多边形张开"  ⟺  m_wcv[p] != 0
+//       m_wc（本类用来判定的那个 wc）  =   当前 wcv 非零的 property 个数
+//   所以 wc 的语义是"此处有几个多边形叠在一起"，与方向、绕行圈数无关。
+//
+// 判定条件（实现见 dbEdgeProcessor.cc 的 result_by_mode）：
+//       result = (wc > min_wc)      ← 严格大于
+//   代入可得：
+//       min_overlap = 0  →  wc >= 1  →  "至少 1 个多边形"  ⇒ 输出全部多边形（普通融合）
+//       min_overlap = 1  →  wc >= 2  →  "至少 2 个多边形重叠处才输出"
+//       min_overlap = n  →  wc >= n+1
+//   这与上面英文类文档的表述**一致**（"0 = all polygons，1 = at least two"），
+//   已核对实现，不存在差一问题。但请注意"至少 n+1 个"这个实际效果，
+//   因为 wc 是"个数"而条件是"严格大于"，初看容易数错。
+//
+// 与 SimpleMerge 的分工（两者名字很像，用途不同）：
+//   SimpleMerge —— 把所有多边形**合在一起**算一个总环绕数（重叠可能相互抵消）
+//   MergeOp     —— 每个多边形**先各自归一化**（只看它自己是否张开），
+//                  再数"有几个叠在一起"，因此更适合"判定重叠数目"的场景
+//
+// 相关：便捷函数 EdgeProcessor::merge(...) 的 min_wc 参数就是本类的 min_overlap。
+//       实现里它给第 i 个多边形分配 property = i（见 .cc），正好对应"按 property 计数"。
+// [[ZH-END]]
 class DB_PUBLIC MergeOp 
   : public EdgeEvaluatorBase 
 {
@@ -957,6 +1061,8 @@ public:
    *
    *  @param min_overlap See class description
    */
+  // [[ZH]] 功能：构造重叠数评估器。min_overlap 的含义见上面的说明
+  // [[ZH]]       （实际判定为 wc > min_overlap，即"多于 min_overlap 个多边形重叠处才输出"）。
   MergeOp (unsigned int min_overlap = 0);
 
   virtual void reset ();
