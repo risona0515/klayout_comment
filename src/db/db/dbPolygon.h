@@ -49,6 +49,75 @@
 
 namespace db {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbPolygon.h —— 多边形体系（本库最核心、也最容易迷路的几何类型）
+// ============================================================================
+//
+// 【为什么本文件难读】
+//   同一个“多边形”概念在这里有**多个变体**，名字相近、能力不同：
+//     polygon / simple_polygon / polygon_ref / …WithProperties
+//   新人最常见的障碍就是把它们搞混。先把下面两张表看明白，后面会顺利很多。
+//
+// ---------------------------------------------------------------------------
+//  表一：四种“形态”（按能力从弱到强）
+// ---------------------------------------------------------------------------
+//   simple_polygon<C>
+//       最简单：**一圈点**（无孔、无属性）。
+//       数学上就是“简单多边形”（不自相交）。
+//       ★ 它是底层存储单位 —— polygon 内部存的就是一个或多个 simple_polygon。
+//
+//   polygon<C>   ★ 最常用（typedef 为 db::Polygon）
+//       完整多边形：可以有**孔洞(holes)**，也可以带**属性(properties)**。
+//       内部表示 = 一个“外轮廓” + 若干个“孔洞轮廓”（每个都是 simple_polygon）。
+//       ★ 版图里一个带孔的环、一个挖空的区域，用的就是它。
+//
+//   polygon_ref<Poly, Tr>
+//       ★ 不是“另一个多边形”，而是一个**轻量引用/句柄**：
+//       指向外部的多边形数据 + 一个变换(Tr)。它**不拥有**数据 ——
+//       所以拷贝一个 polygon_ref 很便宜（只拷贝引用与变换，不拷贝点）。
+//       用途：在不复制几何的前提下“临时改变视角”（如带位移地引用同一个多边形）。
+//       ★ 名字里的 Ref 就是这个意思；看到 Ref/Ptr 类类型要先想到“不拥有数据”。
+//
+//   …WithProperties
+//       在形态之上再挂属性（可由 dbPropertiesRepository 管理的键值对）。
+//       用于“这个图形属于哪个网络/哪层/带什么标记”。
+//       ★ 注意：属性不在几何对象内部，而是通过属性 ID 引用仓库中的数据。
+//
+// ---------------------------------------------------------------------------
+//  表二：坐标类型（D 前缀）
+// ---------------------------------------------------------------------------
+//   db::Polygon / db::SimplePolygon           整数坐标（DBU）—— 版图存储用
+//   db::DPolygon / db::DSimplePolygon         浮点坐标 —— 精确几何运算用
+//   两者接口一致，可互相转换（会按 DBU 舍入）。
+//
+// ---------------------------------------------------------------------------
+//  ★★ 轮廓的“规范化”约定 —— 与 dbEdge.h/EdgeProcessor 直接相关
+// ---------------------------------------------------------------------------
+//   轮廓(contour)被存储为**规范化**形式（上面英文注释已说明），包含两条约定：
+//
+//     1) 起点固定：以 operator< 意义下**最小的点**作为第一个点。
+//        → 好处：同一个多边形无论怎么构造，其内部表示唯一，可直接比较。
+//        → 代价：插入/删除顶点后需要重新规范化（看函数名里的 normalize）。
+//
+//     2) 方向有语义：**外轮廓(hull) 与孔洞(hole) 的绕行方向相反**。
+//        （与 EdgeProcessor 输出“外轮廓顺时针、孔洞逆时针”是同一套约定）
+//        → 这样“点是否在多边形内部”可以统一用环绕数算出，
+//          且正/负环绕数就能区分“在外轮廓内”与“在孔洞内”。
+//        ★ 这是多边形能与布尔运算/DRC 无缝衔接的根本原因。
+//
+// 【压缩(compression)】
+//   名为 default_compression 的函数决定该类多边形**是否丢弃共线冗余顶点**：
+//     整数坐标 → true （丢弃共线点，省内存，且整数下不会损失形状）
+//     浮点坐标 → false（不丢弃 —— 注释指出“没有好处”，因为浮点下
+//                       共线点可能携带有意义的精确位置信息）
+//   ★ 这就是一个“同一算法在整数/浮点下取不同策略”的例子。
+//
+// 【与其它几何类型的关系】
+//   point/vector（基础）→ edge（边界）→ polygon（面）
+//   EdgeProcessor 做布尔运算时会把 polygon 打散成边，结果再由
+//   PolygonGenerator 缝合回 polygon（见 dbPolygonGenerators.h）。
+// [[ZH-END]]
 template <class Coord> class generic_repository;
 class ArrayRepository;
 
@@ -84,6 +153,33 @@ inline bool default_compression<db::DCoord> ()
  *  and a clockwise or counter-clockwise orientation for
  *  hull and holes respectively.
  */
+// [[ZH-BEGIN]]
+// 功能：**闭合轮廓**类型 —— 一圈首尾相接的点。多边形体系的最底层存储单位。
+//
+// 【它是什么、不是什么】
+//   · 是：一圈有序的点（相当于一圈首尾相接的边）。
+//   · 不是：完整的多边形。轮廓**本身不带**“这是外轮廓还是孔洞”的信息 ——
+//     那由持有它的 polygon 决定（一个 polygon = 外轮廓 + 若干孔洞轮廓）。
+//
+// 【★ “规范化(normalized)”的两条约定】展开上面英文注释：
+//   1) **起点固定**：以 operator< 意义下最小的点作为第一个点。
+//      目的：让同一轮廓只有**唯一**的内部表示，从而能直接比较两个轮廓是否相同。
+//   2) **方向携带语义**：外轮廓与孔洞的绕行方向相反 ——
+//      与 dbEdge.h 的“边的右侧 = 内部”以及 EdgeProcessor 的输出约定一致。
+//      这使得“内部/外部”可以用统一的环绕数规则判定（孔洞靠方向区分）。
+//
+// 【对使用者的实际影响 —— 容易踩的坑】
+//   因为存储是规范化的，**不要假设点序与你传入时相同**：
+//     · 第一个点不是你给的那个，而是最小的那个；
+//     · 方向可能被翻转成规范方向。
+//   若你需要保留原始输入顺序，必须自己另存 —— 轮廓不保证保留它。
+//   反过来，这也意味着“两个看起来点序不同的相同轮廓”会被判为相等，这是好事。
+//
+// 【压缩】见上面 default_compression：整数坐标丢弃共线冗余顶点，浮点不丢弃。
+//
+// 构建说明：本类用**显式实例化**（见注释 “we do explicit instantiation”），
+//   因此声明为 DB_PUBLIC 而非 _TEMPLATE —— 这只是构建方式的选择，不影响用法。
+// [[ZH-END]]
 
 //  NOTE: we do explicit instantiation, so the exposure is declared
 //  as DB_PUBLIC - as if it wasn't a template
@@ -1470,6 +1566,36 @@ private:
  *  lapping. This must be ensured by the user of the object
  *  when filling the contours.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **完整多边形** —— 一个外轮廓(hull) + 零到多个孔洞(hole)。最常用的多边形类型。
+//
+// 【内部结构（理解本类的关键）】
+//      polygon<C>
+//        └─ contour_list_type = tl::vector<contour_type>   ← 轮廓列表
+//             [0]  = 外轮廓 (hull)
+//             [1..] = 孔洞 (holes)
+//       每个 contour_type = polygon_contour<C> = 一圈规范化的点（见其说明）
+//   ★ 所以“带孔多边形”不是一种特殊类型，而是同一个 polygon 里有多个轮廓。
+//     区分外轮廓/孔洞靠**绕行方向**（见下），而不是靠下标 —— 尽管实践中 hull 在 [0]。
+//
+// 【规范化约定（上游文档已写明，这里强调对使用者的影响）】
+//   · 点序：以**最左最低的点**作为首点（contour 的规范化）。
+//   · 方向：**外轮廓顺时针(clockwise)**、**孔洞逆时针(counter-clockwise)**。
+//     ★ 这与 EdgeProcessor 的输出约定完全一致 —— 正是两者能无缝衔接的原因。
+//
+// 【★★ 一个必须知道的安全性边界】
+//   上面英文明确写着：“It is in no way checked that the contours are not
+//   overlapping” —— 即**本类不校验轮廓是否重叠**。
+//   若孔洞跑到外轮廓之外、或孔洞互相重叠，本类**不会报错**，
+//   只会产生一个“看起来合法但语义错误”的对象，后续运算可能给出奇怪结果。
+//   ★ 结论：**输入合法性由调用者负责**。需要保证正确性时，
+//     应先做一次布尔运算（如 simple_merge / boolean）来“清洗”多边形。
+//
+// 【相关类型（容易混）】见本文件头的表一/表二：
+//   simple_polygon  → 无孔的简化形态
+//   polygon_ref     → 引用 + 变换（不拥有数据）
+//   …WithProperties → 附加属性（经属性 ID 引用仓库）
+// [[ZH-END]]
 
 template <class C>
 class DB_PUBLIC_TEMPLATE polygon
@@ -3344,6 +3470,33 @@ private:
  *  A polygon reference is basically a proxy to a polygon and
  *  is used to implement polygon references with a repository.
  */
+// [[ZH-BEGIN]]
+// 功能：多边形的**引用（代理）** —— 指向某个真实多边形 + 一个变换，**不拥有数据**。
+//
+// 【为什么需要它 —— 解决的真实问题】
+//   版图里同一个图形可能在很多地方以不同位置/朝向出现。
+//   若每次引用都拷贝一份多边形，内存会爆（版图动辄上亿图形）。
+//   因此用“轻量引用 + 变换”代替“拷贝”：
+//     拷贝 polygon      → 拷贝全部顶点（贵）
+//     拷贝 polygon_ref  → 拷贝一个指针 + 一个变换（便宜）
+//   ★ 名字里的 Ref 就是这个含义 —— 看到 Ref/Ptr 类类型应先想到“不拥有数据”。
+//
+// 【继承关系】public shape_ref<Poly, Trans> —— 因此它能参与库中统一的
+//   “shape 引用”体系（与 db::Shape 等同机制，见 dbShape.h）。
+//
+// 【模板参数】Poly = 被引用的多边形类型（Polygon / SimplePolygon ...）；
+//             Trans = 附带的变换类型（如 Disp 仅位移、UnitTrans 无变换）。
+//
+// 【★ 两个必须知道的坑】
+//   1) **生命周期**：它只持有引用。若被引用的原多边形被销毁，本对象就成了悬空引用。
+//      （默认构造出来的引用是**无效的** —— 见上面英文注释 "invalid polygon reference"。）
+//   2) **不能通过它修改原多边形**：引用语义是只读视角，不是所有权转移。
+//      需要修改请先取出真实多边形。
+//
+// 【相关 typedef】（见本文件末尾）：
+//   PolygonRef / SimplePolygonRef  → 带 Disp（可位移）
+//   PolygonPtr / SimplePolygonPtr  → 带 UnitTrans（无变换，纯指针语义）
+// [[ZH-END]]
 
 template <class Poly, class Trans>
 class polygon_ref
@@ -3708,6 +3861,42 @@ operator<< (std::ostream &os, const simple_polygon<C> &p)
   return (os << p.to_string ());
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  多边形体系的 typedef 总表 —— 写代码时实际用的类型名
+// ============================================================================
+//
+// ★ 命名规律（记不住具体名字时用它推断）：
+//     D 前缀     → 浮点坐标（DCoord）；不带 D → 整数坐标（Coord）
+//     Simple     → 无孔版本
+//     Ref / Ptr  → 引用（不拥有数据）；Ref 带位移能力，Ptr 带恒等变换
+//     WithProperties → 附加属性（经属性 ID 引用仓库）
+//
+//  名称                  形态                 坐标     用途 / 提示
+//   ---------------       ----------------     ------   ------------------------------
+//   Polygon          ★    polygon              整数     ★ **最常用**：带孔、可带属性
+//   DPolygon              polygon              浮点     需要子 DBU 精度的几何运算
+//   SimplePolygon         simple_polygon       整数     无孔的简化形态（省内存、更快）
+//   DSimplePolygon        simple_polygon       浮点     同上，浮点版
+//   PolygonRef            polygon_ref          整数     引用 + 位移（不拷贝几何）
+//   DPolygonRef           polygon_ref          浮点     同上
+//   SimplePolygonRef      polygon_ref          整数     简单多边形的引用 + 位移
+//   DSimplePolygonRef     polygon_ref          浮点     同上
+//   PolygonPtr            polygon_ref          整数     引用但**无变换**（纯指针语义）
+//   DPolygonPtr           polygon_ref          浮点     同上
+//   SimplePolygonPtr      polygon_ref          整数     简单多边形的纯引用
+//   DSimplePolygonPtr     polygon_ref          浮点     同上
+//
+// 【★ 选择指南 —— 实际工作中最常遇到的三种情形】
+//   · 存图形 / 做布尔运算 / 算面积    → 用 **Polygon**（省内存可用 SimplePolygon）
+//   · 需要“不拷贝地引用同一图形”      → 用 **PolygonRef**
+//   · 需要任意角度/缩放且要求精度     → 用 **DPolygon**（整数版会把结果舍入）
+//
+// 【与 dbShape.h 的关系】
+//   db::Shape 是**版图存储层面**的图形句柄（可能是 box / polygon / path / ...）；
+//   本组是**几何运算层面**的多边形类型。两者通过 Shape 的转换方法互通。
+//   ★ 常见混淆：Shape **不是** Polygon 的别名 —— 它可能是任何图形类型。
+// [[ZH-END]]
 /**
  *  @brief The standard polygon typedef
  */
