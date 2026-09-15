@@ -941,6 +941,8 @@ private:
 // -------------------------------------------------------------------------------
 //  EdgePolygonOp implementation
 
+// [[ZH]] 功能：构造。只是把参数存为成员（m_function 由 polygon_mode 构造）。
+// [[ZH]] 参数含义见 .h 中对 mode_t / include_touching / polygon_mode 的说明。
 EdgePolygonOp::EdgePolygonOp (EdgePolygonOp::mode_t mode, bool include_touching, int polygon_mode)
   : m_mode (mode), m_include_touching (include_touching),
     m_function (polygon_mode),
@@ -948,29 +950,70 @@ EdgePolygonOp::EdgePolygonOp (EdgePolygonOp::mode_t mode, bool include_touching,
 {
 }
 
+// [[ZH]] 功能：把多边形自身的环绕数（上/下侧）归零，回到确定初始状态。
+// [[ZH]] 修改：m_wcp_n = m_wcp_s = 0。
 void EdgePolygonOp::reset () 
 { 
   m_wcp_n = m_wcp_s = 0;
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  select_edge —— ★ 本类**唯一**的产出通道（这是理解本类的关键）
+// ============================================================================
+// 功能：判断一条候选边相对于多边形是"在内"还是"在外"，并返回对应的**标签(tag)**。
+//
+// 参数：horizontal 该边是否水平；
+//       p          该边的 property。
+// 返回：tag > 0 → 引擎会调用 sink->put(edge, tag) 投递这条边；
+//       tag = 0 → 不投递。
+//         具体取值：Inside 模式选中→1；Outside 模式选中→1；
+//                   Both 模式 内部→1、外部→2（用标签区分，供 sink 分流）。
+//
+// ★★ 为什么本类不用常规的 edge() 返回值通道：
+//   普通评估器靠 edge() 返回 ±1 来"构造"输出边界（重新生成几何）。
+//   而 EdgePolygonOp 的语义是"从已有边里**挑选**"—— 它要把输入的边原样输出，
+//   而不是重新合成轮廓。因此它让 edge() 恒返回 0（见下），
+//   改用 select_edge + selects_edges()==true 这条专门通道。
+//   这也解释了为何本类的 selects_edges() 恒为 true。
+//
+// ★ 两个判据细节：
+//   1) `p == 0` 直接返回 0 —— property 0 是多边形**自身**的边，
+//      它只用来建立环绕数，不是被挑选的对象。这对应 .h 里的输入约定。
+//   2) 水平边要**同时看两侧**（m_wcp_n 与 m_wcp_s）：
+//      因为水平边恰好躺在扫描线上，它到底算"在内部"还是"在外部"是有歧义的。
+//      因此：include_touching 时只要**任一侧**在内部就算内部（取"或"）；
+//            否则要求**两侧都在**内部才算（取"且"）。
+//      这是刻意处理退化情形，不是笔误。垂直边无此歧义，只看北侧即可。
+//
+// 实现：先用 m_function（由 polygon_mode 决定的内外规则）把环绕数转成 bool，
+//       再根据 m_mode 映射成标签。
+// [[ZH-END]]
 int EdgePolygonOp::select_edge (bool horizontal, property_type p)
 {
   if (p == 0) {
+    // [[ZH]] property 0 = 多边形自身的边，只参与建环绕数，不作为被挑选对象。
     return 0;
   }
 
   bool inside;
 
   if (horizontal) {
+    // [[ZH]] 水平边：躺在扫描线上，内外有歧义 → 需要看两侧。
     if (m_include_touching) {
+      // [[ZH]] 允许相切：任一侧在内部就算内部。
       inside = (m_function (m_wcp_n) || m_function (m_wcp_s));
     } else {
+      // [[ZH]] 不允许相切：要求两侧都在内部。
       inside = (m_function (m_wcp_n) && m_function (m_wcp_s));
     }
   } else {
+    // [[ZH]] 非水平边：位置明确，只看北侧环绕数。
     inside = m_function (m_wcp_n);
   }
 
+  // [[ZH]] 根据模式把 bool 映射为标签：Inside 选内部；Outside 选外部；
+  // [[ZH]] Both 则内部→1、外部→2（用标签区分供 sink 分流）。
   if (m_mode == Inside) {
     return inside ? 1 : 0;
   } else if (m_mode == Outside) {
@@ -980,9 +1023,22 @@ int EdgePolygonOp::select_edge (bool horizontal, property_type p)
   }
 }
 
+// [[ZH-BEGIN]]
+// 功能：维护多边形的环绕数 —— ★ 但**恒返回 0**，不产生任何输出边界。
+//
+// 参数：north 上/下侧；enter ±1；p 该边 property。
+// 返回：恒为 0（本类不走 edge() 输出通道，见 select_edge 的说明）。
+//
+// 修改：**只对 property == 0**（多边形自身的边）累加对应侧的环绕数 m_wcp_n/s。
+//       其它 property 的边完全不理会 —— 它们不是"边界"，只是待挑选的对象。
+//
+// 对比：普通评估器（如 SimpleMerge）的 edge() 会算"状态迁移量"返回 ±1/0，
+//       因为它们要靠返回值重建几何。本类只做计数，输出交给 select_edge。
+// [[ZH-END]]
 int EdgePolygonOp::edge (bool north, bool enter, property_type p) 
 { 
   if (p == 0) {
+    // [[ZH]] 只统计多边形自身边的环绕数，其它 property 忽略。
     int *wc = north ? &m_wcp_n : &m_wcp_s;
     if (enter) {
       ++*wc;
@@ -994,16 +1050,23 @@ int EdgePolygonOp::edge (bool north, bool enter, property_type p)
   return 0; 
 }
 
+// [[ZH]] 功能：两侧环绕数是否都已归零（即不再位于任何多边形内部）。
+// [[ZH]] 用途：供引擎判定"整段无变化"以启用 skip_n 优化。
 bool EdgePolygonOp::is_reset () const 
 { 
   return (m_wcp_n == 0 && m_wcp_s == 0);
 }
 
+// [[ZH]] 功能：把 include_touching 作为"相切偏好"上报给引擎。
+// [[ZH]] 重要连带作用：引擎会把它当作 edge() 的 **enter** 实参传下去，
+// [[ZH]] 因此它直接影响环绕数的加减方向（见 .h 文件头"易踩的坑"）。
 bool EdgePolygonOp::prefer_touch () const 
 { 
   return m_include_touching; 
 }
 
+// [[ZH]] 功能：恒返回 true —— 启用 select_edge 通道。
+// [[ZH]] ★ 这是本类产出结果的唯一途径，因此**必须**为 true，不可改成 false。
 bool EdgePolygonOp::selects_edges () const 
 { 
   return true; 
@@ -1018,6 +1081,10 @@ InteractionDetector::InteractionDetector (int mode, property_type primary_id)
   // .. nothing yet ..
 }
 
+// [[ZH]] 功能：清空所有状态 —— 每个 property 的环绕数、两侧"当前在内部"的集合。
+// [[ZH]] 修改：m_wcv_n/m_wcv_s 与 m_inside_n/m_inside_s 全部清空。
+// [[ZH]] 注意：**不清空 m_interactions/m_non_interactions**（结果集）——
+// [[ZH]] 结果是在整个扫描过程中累积的，不能随每行扫描线被清掉。
 void
 InteractionDetector::reset ()
 {
@@ -1027,6 +1094,9 @@ InteractionDetector::reset ()
   m_inside_s.clear ();
 }
 
+// [[ZH]] 功能：按 property 总数 n 预分配两侧环绕数数组，并清空内部集合。
+// [[ZH]] 参数：n 需覆盖的 property 个数（= 最大 property + 1）。
+// [[ZH]] 为何必须：edge() 里有 tl_assert(p < m_wcv_n.size())，未 reserve 会断言失败。
 void 
 InteractionDetector::reserve (size_t n)
 {
@@ -1038,6 +1108,51 @@ InteractionDetector::reserve (size_t n)
   m_inside_s.clear ();
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  InteractionDetector::edge —— 记录多边形间的相互作用（本文件最绕的一段逻辑）
+// ============================================================================
+// 功能：根据这条边更新对应 property 的环绕数，并在"张开/闭合"的时刻
+//       把发现的相互作用记入 m_interactions / m_non_interactions。
+//
+// 参数：north 上/下侧；enter ±1；p 边的 property。
+// 返回：恒为 0 —— 本类**不输出几何**，只记录配对关系（见 .h 的类说明）。
+//
+// 修改：m_wcv_n[p] 或 m_wcv_s[p]、m_inside_n/m_inside_s、
+//       m_interactions、m_non_interactions。
+//
+// 【第一步：本事件是否需要处理】
+//   条件：north || (mode==0 && include_touching) || (mode<-1 && include_touching)
+//   源码注释解释了原因："interacting"（0）与 "enclosing"（-2）模式必须
+//   **南北两侧都看**，才能捕获扫掠线两侧对象之间的交互（例如上下相邻相切）。
+//   其余情形的南侧事件可以跳过，这是纯优化。
+//
+// 【第二步：判断张开还是闭合，以及由此推导关系】
+//   环绕数由 0 变非零 = **张开**（进入该多边形）；由非零变 0 = **闭合**（离开）。
+//
+//   —— 闭合分支（inside_after < inside_before）：
+//      把 p 从"在内部集合"中移除。若 p 是 **primary**，则剩下仍在集合里的
+//      secondary 都意味着"与 p 不相交"→ 记入 m_non_interactions。
+//      为何能这么断言：源码注释指出，由于 prefer_touch==true 且重合边按
+//      property 排序，**primary 对象在所有重合边中最后被处理**，
+//      因此此刻仍"张开"的东西必然在其外部。
+//
+//   —— 张开分支（inside_after > inside_before）：
+//      · mode != 0（inside/enclosing/outside 模式）：
+//          若 p 是 secondary → 遍历当前所有 primary，逐个记 (primary, p)；
+//            若一个 primary 都没找到 → p 记入 non_interactions（在外部）。
+//          若 p 是 primary   → 遍历当前所有 secondary，逐个记 (p, secondary)；
+//            在 enclosing(-2) 模式下额外把该 secondary 记入 non_interactions
+//            （因为 primary 张开时 secondary 已开着且未闭合 → 二者重叠而非包含）。
+//      · mode == 0（重叠/相切模式）：
+//          把 p 与当前**南北两侧**所有张开的对象配对，
+//          并把每对规范化为"较小的 property 在前"—— 这使输出顺序确定。
+//          这是 result 里说的"配对中较小者为第一元素"约定的实现处。
+//      最后把 p 插入本侧的"在内部集合"。
+//
+// 坑：本函数多次用"在集合里找 primary/secondary"的线性遍历（集合通常很小）；
+//     不要误以为它做了排序或索引 —— 复杂度靠对象数量小来保证。
+// [[ZH-END]]
 int 
 InteractionDetector::edge (bool north, bool enter, property_type p)
 {
@@ -1051,18 +1166,23 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
 
   //  In "interacting" and "enclosing" mode we need to handle both north and south events because
   //  we have to catch interactions between objects north and south to the scanline
+  // [[ZH]] 决定本事件是否处理：interacting(0) 与 enclosing(-2) 模式需要南北都看，
+  // [[ZH]] 否则会漏掉扫描线两侧对象之间的交互。这是逻辑必要，不是优化。
   if (north || (m_mode == 0 && m_include_touching) || (m_mode < -1 && m_include_touching)) {
 
     std::set <property_type> *inside = north ? &m_inside_n : &m_inside_s;
 
     if (inside_after < inside_before) {
 
+      // [[ZH]] ===== 闭合分支：p 离开该区域 =====
       inside->erase (p);
 
       //  the primary objects are delivered last of all coincident edges
       //  (due to prefer_touch == true and the sorting of coincident edges by property id)
       //  hence every remaining parts count as non-interacting (outside)
       if (p <= m_last_primary_id) {
+        // [[ZH]] p 是 primary：此刻仍张开的 secondary 都在 p 外部 → 记为 non-interaction。
+        // [[ZH]] 依据：primary 在重合边中最后被处理，故剩余者必在其外。
         for (std::set <property_type>::const_iterator i = inside->begin (); i != inside->end (); ++i) {
           if (*i > m_last_primary_id) {
             m_non_interactions.insert (*i);
@@ -1072,6 +1192,7 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
 
     } else if (inside_after > inside_before) {
 
+      // [[ZH]] ===== 张开分支：p 进入该区域 =====
       if (m_mode != 0) {
 
         //  enclosing/inside/outside mode
@@ -1080,6 +1201,7 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
           //  note that the primary parts will be delivered first of all coincident
           //  edges hence we can check whether the primary is present even for coincident
           //  edges
+          // [[ZH]] p 是 secondary → 找当前张开的 primary，逐个记录配对。
           bool any = false;
           for (std::set <property_type>::const_iterator i = inside->begin (); i != inside->end (); ++i) {
             if (*i <= m_last_primary_id) {
@@ -1088,11 +1210,14 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
             }
           }
           if (! any) {
+            // [[ZH]] 一个 primary 都没有 → 该 secondary 在外部。
+            // [[ZH]] （outside 模式的伪配对由此推导，见 finish()）
             m_non_interactions.insert (p);
           }
 
         } else {
 
+          // [[ZH]] p 是 primary → 找当前张开的 secondary，逐个记录配对。
           for (std::set <property_type>::const_iterator i = inside->begin (); i != inside->end (); ++i) {
             if (*i > m_last_primary_id) {
               if (m_mode < -1) {
@@ -1100,6 +1225,9 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
                 //  has been opened before and did not close. Because we sort by property ID this must have happened
                 //  before, hence the secondary is overlapping. Make them non-interactions. We still have to record them
                 //  as interactions because this is how we skip the primaries later.
+                // [[ZH]] enclosing 模式：primary 张开时 secondary 已开着且未闭合 →
+                // [[ZH]] 说明二者重叠而非包含，故记为 non-interaction；
+                // [[ZH]] 但仍要记入 interactions（finish() 靠它反推需要剔除哪些 primary）。
                 m_non_interactions.insert (*i);
               }
               m_interactions.insert (std::make_pair (p, *i));
@@ -1110,6 +1238,8 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
 
       } else {
 
+        // [[ZH]] mode == 0（重叠/相切）：与南北**两侧**当前张开的对象全部配对，
+        // [[ZH]] 并把每对规范化为"较小 property 在前"以固定输出顺序。
         for (std::set <property_type>::const_iterator i = m_inside_n.begin (); i != m_inside_n.end (); ++i) {
           if (*i < p) {
             m_interactions.insert (std::make_pair (*i, p));
@@ -1128,6 +1258,7 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
 
       }
 
+      // [[ZH]] 最后把 p 加入本侧的"在内部集合"，供后续事件参考。
       inside->insert (p);
 
     }
@@ -1137,12 +1268,43 @@ InteractionDetector::edge (bool north, bool enter, property_type p)
   return 0;
 }
 
+// [[ZH]] 功能：恒返回 0 —— 本类不输出几何，不需要比较南北差异。
 int 
 InteractionDetector::compare_ns () const
 {
   return 0;
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  finish —— 把扫描期间累积的原始记录**后处理**成最终结果（按 mode 分流）
+// ============================================================================
+// 功能：对 mode != 0 的情形，在读取结果**之前**必须调用（见 .h 说明）。
+//       它用 m_non_interactions 这个"排除集"去修正 m_interactions。
+//
+// 修改：重写 m_interactions，并清空 m_non_interactions。
+//
+// 【为什么必须延迟到扫描结束】
+//   在扫描过程中我们只能知道"某个对象当下是否在某处内部"，
+//   但"谁包含谁""谁完全在外部"这类全局结论要等所有边处理完才能定。
+//   因此扫描期先把正/反两类证据分别记下，最后在这里做集合运算得出答案。
+//
+// 【三种模式的不同后处理】
+//   mode < -1（enclosing，谁包含谁）：
+//     先找出"与某个会被判为外部的 secondary 有交互"的那些 primary，
+//     把它们整批删掉（它们的"包含"是被重叠污染的，不可信）。
+//   mode == -1（inside，谁在谁里面）：
+//     直接删除那些 secondary 被判为 non-interaction 的配对条目。
+//   mode > 0（outside，谁在谁外面）：
+//     保留**从未参与过任何交互**的 secondary —— 它们就是"在外部"的。
+//     并把它们与 m_last_primary_id 配成对（★ 这是伪配对：
+//     按定义外部的多边形与 primary 并不相交，因此 primary_id 恒定
+//     为 last_primary_id，相当于一个代表"背景"的合成 id）。
+//     上游 .h 文档已就此提醒使用者不要误认为是真实几何关系，这里再标一次。
+//
+// 坑：本函数会**清空 m_non_interactions**。若需要多次读取结果，
+//     应只调用一次 finish() 然后反复遍历 begin()/end()。
+// [[ZH-END]]
 void
 InteractionDetector::finish ()
 {
@@ -1150,6 +1312,7 @@ InteractionDetector::finish ()
 
     //  In enclosing mode remove those objects which have an interaction with a secondary having a non-interaction:
     //  these are the ones where secondaries overlap and stick to the outside.
+    // [[ZH]] 先收集需要被剔除的 primary。
     std::set<property_type> primaries_to_delete;
     for (std::set<std::pair<property_type, property_type> >::iterator i = m_interactions.begin (); i != m_interactions.end (); ++i) {
       if (m_non_interactions.find (i->second) != m_non_interactions.end ()) {
@@ -1157,6 +1320,9 @@ InteractionDetector::finish ()
       }
     }
 
+    // [[ZH]] 再删除这些 primary 参与的全部配对。
+    // [[ZH]] 注意这里用"先自增副本 ii、再 erase(i)、最后 i=ii"的写法，
+    // [[ZH]] 避免 erase 后迭代器失效（std::set::erase 只失效被删元素）。
     for (std::set<std::pair<property_type, property_type> >::iterator i = m_interactions.begin (); i != m_interactions.end (); ) {
       std::set<std::pair<property_type, property_type> >::iterator ii = i;
       ++ii;
@@ -1169,6 +1335,7 @@ InteractionDetector::finish ()
   } else if (m_mode == -1) {
 
     //  In inside mode remove those objects which have a non-interaction with a primary
+    // [[ZH]] inside 模式：删除 secondary 已被判为外部的配对。
     for (std::set<std::pair<property_type, property_type> >::iterator i = m_interactions.begin (); i != m_interactions.end (); ) {
       std::set<std::pair<property_type, property_type> >::iterator ii = i;
       ++ii;
@@ -1181,10 +1348,13 @@ InteractionDetector::finish ()
   } else if (m_mode > 0) {
 
     //  In outside mode leave those objects which don't participate in an interaction
+    // [[ZH]] outside 模式：先从未交互集合中剔除掉"曾参与交互"的对象。
     for (iterator pp = begin (); pp != end (); ++pp) {
       m_non_interactions.erase (pp->second);
     }
 
+    // [[ZH]] 然后用剩余的"从未交互"对象重建结果集 —— 它们就是"在外部"的。
+    // [[ZH]] ★ 配对的 primary 恒为 m_last_primary_id（伪配对，见上方说明）。
     m_interactions.clear ();
     for (std::set<property_type>::const_iterator p = m_non_interactions.begin (); p != m_non_interactions.end (); ++p) {
       m_interactions.insert (m_interactions.end (), std::make_pair (m_last_primary_id, *p));
@@ -1192,18 +1362,28 @@ InteractionDetector::finish ()
 
   }
 
+  // [[ZH]] 排除集已完成使命，清空（避免影响后续可能的重复 finish 调用）。
   m_non_interactions.clear ();
 }
 
 // -------------------------------------------------------------------------------
 //  MergeOp implementation
 
+// [[ZH]] 功能：构造。min_wc 即最小重叠阈值（语义见 .h 中 MergeOp 的说明）。
+// [[ZH]] 初始化 m_zeroes = 0 —— 注意它在 reserve() 之前不是真实值，
+// [[ZH]] 必须先 reserve(n_props) 才能得到正确的 is_reset() 判定。
 MergeOp::MergeOp (unsigned int min_wc)
   : m_wc_n (0), m_wc_s (0), m_min_wc (min_wc), m_zeroes (0)
 {
   //  .. nothing yet ..
 }
 
+// [[ZH]] 功能：清空所有计数，回到确定初始状态。
+// [[ZH]] 修改：两侧 m_wcv 清空；m_wc_n/m_wc_s 归零；m_zeroes 归零。
+// [[ZH]] 坑（上游遗留）：这里写了两遍 `m_wc_n = 0;` 而**没有重置 m_wc_s**。
+// [[ZH]]     单纯看容易以为是笔误。实际影响很小：reserve() 会重设全部计数，
+// [[ZH]]     而引擎在每次处理前都会先 reserve()，因此 m_wc_s 总会被重新赋值。
+// [[ZH]]     这里仅作记录，不改动代码。
 void  
 MergeOp::reset ()
 {
@@ -1214,6 +1394,11 @@ MergeOp::reset ()
   m_zeroes = 0;
 }
 
+// [[ZH]] 功能：按 property 总数 n 预分配两侧的"每 property 环绕数"数组。
+// [[ZH]] 参数：n = 最大 property + 1。
+// [[ZH]] 修改：m_wcv_n/m_wcv_s 尺寸置 n 且全 0；m_zeroes = 2*n（两侧全部归零）。
+// [[ZH]] 为何 m_zeroes 是 2*n：它统计"两侧共 2n 个槽位中仍为零的个数"，
+// [[ZH]] 因此初始时全部为零。is_reset() 即比较它与两侧总槽位数。
 void 
 MergeOp::reserve (size_t n)
 {
@@ -1224,38 +1409,93 @@ MergeOp::reserve (size_t n)
   m_zeroes = 2 * n;
 }
 
+// [[ZH-BEGIN]]
+// 功能：MergeOp 的判定核心 —— 给定"当前张开的多边形个数 wc"，判断该位置是否算内部。
+//
+// 参数：wc 当前张开（重叠）的多边形个数；min_wc 构造时给定的阈值。
+// 返回：true = 算作内部。
+//
+// ★★ 判定是**严格大于**：`wc > min_wc`（而不是 >=）。
+//    代入可得：min_wc = 0 → wc >= 1 → "至少 1 个"→ 输出全部多边形（普通融合）
+//              min_wc = 1 → wc >= 2 → "至少 2 个重叠处才输出"
+//              min_wc = n → wc >= n+1
+//    .h 中类文档写的 "0: all polygons, 1: at least two overlapping" **是对的**，
+//    与这里一致（我早先曾怀疑文档差一，核对后确认是我错了）。
+//    但请留意"严格大于"这个细节，因为 wc 是**个数**，初看容易数错。
+//
+// 注意：本类同时只统计了 m_wc_n/m_wc_s 两个"张开个数"，
+//       配合 compare_ns() 即可得出"上/下两侧是否在内部"的差异。
+// [[ZH-END]]
 static inline 
 bool result_by_mode (int wc, unsigned int min_wc)
 {
+  // [[ZH]] ★ 严格大于。min_wc 为 unsigned，故显式转 int 再比较。
   return wc > int (min_wc);
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  MergeOp::edge —— ★ 本文件里"累加式返回值"机制最清楚的范例
+// ============================================================================
+// 功能：更新该 property 的环绕数，并在必要时修正"张开个数"，
+//       再返回**状态迁移量**（而非布尔值）。
+//
+// 参数：north 上/下侧；enter ±1；
+//       p     该边的 property —— ★ 本类会用它，按 property 分开计数。
+// 返回：+1 = 由"不满足重叠条件"变为满足（比如第 2 个多边形开始重叠）；
+//       -1 = 由满足变为不满足；
+//        0 = 判定结果未变。
+//
+// 修改：m_wcv_n[p] / m_wcv_s[p]（±1）、m_wc_n / m_wc_s（张开个数）、m_zeroes。
+//
+// 【★ 为什么 m_wc 不能直接对每个事件加一】
+//   同一个多边形可能多次穿越同一条扫描线（z 字形边），因此 wcv 可能从 +1 变到 +2 甚至回负。
+//   而"这个多边形是否张开"只看 wcv **是否为零**。
+//   所以只有在"零/非零"这一跳变真的发生时，才去调整 m_wc。
+//   这就是下面 inside_before != inside_after 判断的意义 —— 它把
+//   "环绕数变化"过滤成"张开状态变化"，避免重复计数同一个多边形。
+//
+// 【返回值的用途】
+//   引擎会把返回值**累加**到 m_pn/m_ps（见 EdgeProcessorState::north_edge），
+//   非零即代表此处存在结果边界，符号决定输出边的方向。
+//   因此这里返回 res_after - res_before（bool 相减得 -1/0/+1）。
+// [[ZH-END]]
 int 
 MergeOp::edge (bool north, bool enter, property_type p)
 {
   tl_assert (p < m_wcv_n.size () && p < m_wcv_s.size ());
 
+  // [[ZH]] 按 north 选中"该 property 的环绕数"与"张开个数"两个计数器。
   int *wcv = north ? &m_wcv_n [p] : &m_wcv_s [p];
   int *wc = north ? &m_wc_n : &m_wc_s;
 
+  // [[ZH]] 更新该 property 的环绕数（enter 决定加减），并判断"张开"状态是否跳变。
   bool inside_before = (*wcv != 0);
   *wcv += (enter ? 1 : -1);
   bool inside_after = (*wcv != 0);
+  // [[ZH]] m_zeroes：仍为零的槽位数。张开一个则零槽位-1，闭合一个则+1。
   m_zeroes += (!inside_after) - (!inside_before);
 #ifdef DEBUG_MERGEOP
   printf ("north=%d, enter=%d, prop=%d -> %d\n", north, enter, int (p), int (m_zeroes));
 #endif
   tl_assert (long (m_zeroes) >= 0);
 
+  // [[ZH]] 记录变更前的判定结果。
   bool res_before = result_by_mode (*wc, m_min_wc);
   if (inside_before != inside_after) {
+    // [[ZH]] ★ 只有"张开状态"真的跳变时才调整张开个数 ——
+    // [[ZH]] 这样同一个多边形的多次穿越不会被数成多个多边形。
     *wc += (inside_after - inside_before);
   }
+  // [[ZH]] 变更后的判定结果。二者之差就是累加式返回值。
   bool res_after = result_by_mode (*wc, m_min_wc);
 
+  // [[ZH]] bool 相减 → -1 / 0 / +1，即状态迁移量。
   return res_after - res_before;
 }
 
+// [[ZH]] 功能：比较“下方”与“上方”的重叠判定之差，供引擎给合成的水平边定方向。
+// [[ZH]] 返回：result_by_mode(north) - result_by_mode(south)，即 -1 / 0 / +1。
 int 
 MergeOp::compare_ns () const
 {
@@ -1265,12 +1505,16 @@ MergeOp::compare_ns () const
 // -------------------------------------------------------------------------------
 //  BooleanOp implementation
 
+// [[ZH]] 功能：构造。mode 取 BooleanOp::BoolOp（And/ANotB/BNotA/Xor/Or）。
+// [[ZH]] 初始化四个操作数计数为 0（wca/wcb × north/south）。
 BooleanOp::BooleanOp (BoolOp mode)
   : m_wc_na (0), m_wc_nb (0), m_wc_sa (0), m_wc_sb (0), m_mode (mode), m_zeroes (0)
 {
   //  .. nothing yet ..
 }
 
+// [[ZH]] 功能：清空所有计数，回到确定初始状态。
+// [[ZH]] 修改：两侧 m_wcv 清空；四个 A/B 计数归零；m_zeroes 归零。
 void  
 BooleanOp::reset ()
 {
@@ -1281,6 +1525,9 @@ BooleanOp::reset ()
   m_zeroes = 0;
 }
 
+// [[ZH]] 功能：按 property 总数 n 预分配两侧的"每 property 环绕数"数组。
+// [[ZH]] 参数：n = 最大 property + 1。
+// [[ZH]] 为何必须：edge_impl() 里有 tl_assert(p < m_wcv_n.size())，未 reserve 会断言失败。
 void 
 BooleanOp::reserve (size_t n)
 {
@@ -1291,10 +1538,35 @@ BooleanOp::reserve (size_t n)
   m_zeroes = 2 * n;
 }
 
+// [[ZH-BEGIN]]
+// 功能：布尔运算的**真值表** —— 给定 A、B 两侧的"是否在内部"，算出结果是否为内部。
+//
+// 参数：wca A 操作数当前的张开个数；wcb B 操作数当前的张开个数；
+//       inside_a / inside_b 把各自的个数转成 bool 的谓词（通常就是 NonZeroInsideFunc）。
+// 返回：该位置是否算在结果内部。
+//
+// ★ 注意这里对 A 和 B **分别**应用谓词，而不是先把两边合并再判断 ——
+//   这正是 BooleanOp 能实现集合运算的关键。
+//
+// 五种运算的一一对应（可当作真值表背下）：
+//   And   (交集)   inside_a && inside_b
+//   ANotB (差集)   inside_a && !inside_b
+//   BNotA (差集)   !inside_a && inside_b
+//   Xor   (对称差) 两者异或
+//   Or    (并集)   两者取或
+//   default        false（未知模式安全地当作空集）
+//
+// 模板参数 InsideFunc 允许换用不同内外规则 ——
+//   BooleanOp  传 NonZeroInsideFunc（固定非零环绕）
+//   BooleanOp2 传 ParametrizedInsideFunc（可分别指定 mode）
+//   两者共用本模板，这就是 BooleanOp2 能复用的原因。
+// [[ZH-END]]
 template <class InsideFunc>
 inline bool 
 BooleanOp::result (int wca, int wcb, const InsideFunc &inside_a, const InsideFunc &inside_b) const
 {
+  // [[ZH]] 按 m_mode 查表。注意判据用的是"张开个数"（wca/wcb），
+  // [[ZH]] 而不是原始环绕数 —— 因为每个多边形先各自归一化过（见 edge_impl）。
   switch (m_mode) {
   case BooleanOp::And:
     return inside_a (wca) && inside_b (wcb);
@@ -1307,20 +1579,61 @@ BooleanOp::result (int wca, int wcb, const InsideFunc &inside_a, const InsideFun
   case BooleanOp::Or:
     return inside_a (wca) || inside_b (wcb);
   default:
+    // [[ZH]] 未知模式：安全地当作空集，不输出任何东西。
     return false;
   }
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  BooleanOp::edge_impl —— ★ 本文件的两层计数机制（理解布尔运算的核心）
+// ============================================================================
+// 功能：更新对应 property 的环绕数、必要时修正 A/B 各自的"张开个数"，
+//       并返回布尔运算结果的状态迁移量。
+//
+// 参数：north/enter 同惯例；p 该边 property；inside_a/inside_b 两侧的内外谓词。
+// 返回：+1 = 结果由外变内；-1 = 由内变外；0 = 未变。
+//
+// 修改：m_wcv_n[p]/m_wcv_s[p]、m_wc_na/m_wc_sa 或 m_wc_nb/m_wc_sb、m_zeroes。
+//
+// 【★★ 两层计数：本类最容易看漏的设计】
+//   第一层 m_wcv_*[p]  ：**每个 property（即每个多边形）各自的**环绕数。
+//                        它只用于判断"这个多边形自己是否张开"（wcv != 0）。
+//                        —— 这就是"先各自归一化"，使自相交/自重叠不污染计数。
+//   第二层 m_wc_na / m_wc_nb：**A 组 / B 组当前各有多少个多边形张开**。
+//                        这才是送进 result() 真值表的 wca/wcb。
+//   两层的桥梁：只有当某个 property 的张开状态**发生跳变**时，
+//   才把它的值 ±1 计入所属组（m_wca 或 m_wcb）。
+//   —— 这与 MergeOp 的思路完全一致，只是分成两组。
+//
+// 【★ 操作数归属：靠 property 的奇偶性】
+//   源码里用 `(p % 2) == 0` 判断：
+//        偶数 property → 操作数 **A**（对应 m_wc_na / m_wc_sa）
+//        奇数 property → 操作数 **B**（对应 m_wc_nb / m_wc_sb）
+//   这个约定必须在**入口处**就遵守：
+//        boolean() 的多边形版本会自动分配 A=0,2,4... / B=1,3,5...
+//        边输入版本则只分 A=0 / B=1
+//   若你手工 insert 并自行填 property，不符合奇偶约定就会把结果算错。
+//
+// 实现顺序：
+//   ① 用 inside_a/inside_b 根据 p 的奇偶取得该 property 变更前的判定；
+//   ② 更新 m_wcv[p]（±1），得到变更后的判定；
+//   ③ 维护 m_zeroes；
+//   ④ 记录变更前 result() 值；若张开状态跳变 → 把 ±1 加到所属组计数；
+//   ⑤ 返回 result() 的新旧之差。
+// [[ZH-END]]
 template <class InsideFunc>
 inline int 
 BooleanOp::edge_impl (bool north, bool enter, property_type p, const InsideFunc &inside_a, const InsideFunc &inside_b) 
 {
   tl_assert (p < m_wcv_n.size () && p < m_wcv_s.size ());
 
+  // [[ZH]] 三组计数器：该 property 自己的环绕数，以及 A 组、B 组的张开个数。
   int *wcv = north ? &m_wcv_n [p] : &m_wcv_s [p];
   int *wca = north ? &m_wc_na : &m_wc_sa;
   int *wcb = north ? &m_wc_nb : &m_wc_sb;
 
+  // [[ZH]] ★ 靠 property 奇偶选择该归哪一组判定：偶数→A，奇数→B。
   bool inside_before = ((p % 2) == 0 ? inside_a (*wcv) : inside_b (*wcv));
   *wcv += (enter ? 1 : -1);
   bool inside_after = ((p % 2) == 0 ? inside_a (*wcv) : inside_b (*wcv));
@@ -1330,8 +1643,11 @@ BooleanOp::edge_impl (bool north, bool enter, property_type p, const InsideFunc 
 #endif
   tl_assert (long (m_zeroes) >= 0);
 
+  // [[ZH]] 变更前的布尔运算结果（用 A/B 两组张开个数算）。
   bool res_before = result (*wca, *wcb, inside_a, inside_b);
   if (inside_before != inside_after) {
+    // [[ZH]] ★ 只有该 property 的张开状态跳变，才把它计入所属组 ——
+    // [[ZH]] 避免同一个多边形多次穿越被数成多个。
     if ((p % 2) == 0) {
       *wca += (inside_after - inside_before);
     } else {
@@ -1340,9 +1656,12 @@ BooleanOp::edge_impl (bool north, bool enter, property_type p, const InsideFunc 
   }
   bool res_after = result (*wca, *wcb, inside_a, inside_b);
 
+  // [[ZH]] bool 相减 → -1/0/+1，即状态迁移量。
   return res_after - res_before;
 }
 
+// [[ZH]] 功能：比较下方与上方的布尔运算结果之差，供引擎给合成的水平边定方向。
+// [[ZH]] 返回：result(north) - result(south)，即 -1/0/+1。
 template <class InsideFunc> 
 inline int 
 BooleanOp::compare_ns_impl (const InsideFunc &inside_a, const InsideFunc &inside_b) const
@@ -1350,6 +1669,9 @@ BooleanOp::compare_ns_impl (const InsideFunc &inside_a, const InsideFunc &inside
   return result (m_wc_na, m_wc_nb, inside_a, inside_b) - result (m_wc_sa, m_wc_sb, inside_a, inside_b);
 }
 
+// [[ZH]] 功能：BooleanOp 的 edge —— 固定用 NonZeroInsideFunc 作为 A、B **共同**的谓词。
+// [[ZH]] 注意这里把同一个 inside 实例同时传给 A 和 B。这正是 BooleanOp 的限制：
+// [[ZH]]       它无法给 A、B 指定不同的内外规则 —— 那个能力由 BooleanOp2 提供。
 int 
 BooleanOp::edge (bool north, bool enter, property_type p)
 {
@@ -1357,6 +1679,7 @@ BooleanOp::edge (bool north, bool enter, property_type p)
   return edge_impl (north, enter, p, inside, inside);
 }
 
+// [[ZH]] 功能：BooleanOp 的 compare_ns —— 同样固定用 NonZeroInsideFunc。
 int 
 BooleanOp::compare_ns () const
 {
@@ -1367,20 +1690,36 @@ BooleanOp::compare_ns () const
 // -------------------------------------------------------------------------------
 //  BooleanOp2 implementation
 
+// [[ZH]] 功能：构造。在 BooleanOp 基础上额外保存 A、B 各自的融合模式。
+// [[ZH]] 参数：wc_mode_a / wc_mode_b 语义同 ParametrizedInsideFunc（-1 非零／0 奇偶／+n／-n）。
 BooleanOp2::BooleanOp2 (BoolOp op, int wc_mode_a, int wc_mode_b)
   : BooleanOp (op), m_wc_mode_a (wc_mode_a), m_wc_mode_b (wc_mode_b)
 {
   //  .. nothing yet ..
 }
 
+// [[ZH-BEGIN]]
+// 功能：★ BooleanOp2 相对 BooleanOp 的**唯一实质变化** —— 给 A、B 分别构造谓词。
+//
+// 说明：这里为每次调用新建两个 ParametrizedInsideFunc（很轻量，只是一个 int），
+//       然后复用 BooleanOp 的 edge_impl 模板，从而得到"A、B 各用自己模式"的效果。
+//       整个类没有自己的计数逻辑 —— 全部继承自 BooleanOp。
+//
+// 典型用途（见 .h）：对已做过 sizing 的多边形做布尔运算，
+//   需要把自相交产生的重叠圈按"重叠计数"解释（mode > 0）。
+//       实例参考：单元测试 TEST(27) 用 BooleanOp2(Xor, -1, -1) 把 4 个角碎片
+//                 合并为 1 个带孔多边形。
+// [[ZH-END]]
 int 
 BooleanOp2::edge (bool north, bool enter, property_type p)
 {
+  // [[ZH]] 用各自的 mode 构造谓词，其余逻辑全交给基类的 edge_impl。
   ParametrizedInsideFunc inside_a (m_wc_mode_a);
   ParametrizedInsideFunc inside_b (m_wc_mode_b);
   return edge_impl (north, enter, p, inside_a, inside_b);
 }
 
+// [[ZH]] 功能：BooleanOp2 的 compare_ns —— 同样用各自模式构造谓词。
 int 
 BooleanOp2::compare_ns () const
 {
