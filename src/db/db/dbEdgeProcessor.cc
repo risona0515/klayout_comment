@@ -44,39 +44,128 @@
 namespace db
 {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbEdgeProcessor.cc —— scanline 布尔运算引擎的实现
+// ============================================================================
+//
+// 建议先读 dbEdgeProcessor.h 的文件头注释（那里有整体背景、四阶段划分、
+// wrap count 与 property 两个核心概念）。本文件的注释侧重"实现细节与数据结构"。
+//
+// 【本文件的组织顺序】
+//   §1 工具与比较器        本行以下 ~ 550 行
+//        NonZeroInsideFunc / ProjectionCompare / PolyMapCompare(已废弃)
+//        is_point_on_exact / is_point_on_fuzzy     精确 vs 模糊的"点在边上"
+//        safe_intersect_point                      顺序无关的求交（重要）
+//        CutPoints / WorkEdge                      阶段 1-3 的核心数据结构
+//        EdgePropCompare / EdgeXAtYCompare2        scanline 排序所需的比较器
+//   §2 交点计算            ~1080-1590
+//        add_hparallel_cutpoints                   共线水平边之间的切点
+//        get_intersections_per_band_90             正交（曼哈顿）快速路径
+//        get_intersections_per_band_any            任意角度通用路径
+//   §3 扫描线状态          ~1600-2160
+//        EdgeProcessorState                        单 (sink,evaluator) 的扫描线状态机
+//        EdgeProcessorStates + SkipInfo            单/多路统一 + skip 优化
+//   §4 主驱动板            redo_or_process
+//        阶段 1 prep → 阶段 2 intersections → 阶段 3 split → 阶段 4 production
+//   §5 公开 API 实现       insert / process / redo / simple_merge / merge / size / boolean
+//
+// 【两个贯穿全文件的优化思想，读代码时留意】
+//   ① **正交快速路径**：版图绝大多数图形是曼哈顿的（边水平或垂直）。
+//      两条正交边求交只需 max/min，无需叉积与除法，因而单独写了 *_90 版本。
+//      判断入口会先看"是否全是正交边"，是则走快速路径。
+//   ② **一致性优先于绝对精度**：多处刻意使用 `volatile double` 阻止编译器
+//      把浮点值缓存在寄存器里重结合（见文件内相关注释）——
+//      目的不是数值精度，而是**保证同一位置两次计算得到逐位相同的 double**，
+//      从而使排序稳定、结果可复现。改动这些 volatile 可能引入极难排查的错误。
+//
+// 【调试开关】
+//   把上面 `#if 0` 改为 `#if 1` 可打开 DEBUG_MERGEOP / DEBUG_BOOLEAN /
+//   DEBUG_EDGE_PROCESSOR，在 stderr 打印内部状态（注意会非常啰嗦）。
+// [[ZH-END]]
+// [[ZH]] fill_factor：扫描线"分带(band)"时的容量增长经验系数。
+// [[ZH]] 含义：每扩展一个 y 带，预估还要容纳多少比例的边，用于预分配容器，
+// [[ZH]]       减少处理中的重新分配。1.5 是纯经验值，调大只影响内存占用/速度，
+// [[ZH]]       不影响计算结果（改它不会改变输出的几何）。
 const double fill_factor = 1.5;
 
 // -------------------------------------------------------------------------------
 //  Some utilities ..
 
+// [[ZH-BEGIN]]
+// 功能：最朴素的"内部"谓词 —— 环绕数非零即为内部。
+//       即经典的**非零环绕规则 (non-zero winding rule)**。
+//
+//       ★ 它是 BooleanOp 的**默认**谓词：BooleanOp::edge() 与 BooleanOp::compare_ns()
+//         内部直接构造一个 NonZeroInsideFunc 并把同一实例同时当作 A、B 两个操作数的
+//         谓词（见本文件 BooleanOp::edge 的实现）。
+//         而 BooleanOp2 则改用 ParametrizedInsideFunc，以便给 A、B **分别**指定模式
+//         （这就是 BooleanOp2 相对 BooleanOp 的唯一增强）。
+//
+// 与 ParametrizedInsideFunc 的关系：后者是它的泛化版本（带 mode 参数），
+//       mode = -1 时两者行为完全一致。
+//
+// 参数：wc 环绕数（可为负）。
+// 返回：true = 该位置算作"在图形内部"。
+// [[ZH-END]]
 struct NonZeroInsideFunc 
 {
   inline bool operator() (int wc) const
   {
+    // [[ZH]] 只看是否为零：非零即内部（负环绕数也算内部）。
     return wc != 0;
   }
 };
 
+// [[ZH-BEGIN]]
+// 功能：把一个点序列按"沿某条边的投影长度"排序的比较器。
+//
+// ★ 用在哪里：阶段 3（split）中，把一条边上的切点(cut points)按沿线方向排序，
+//   然后**依次相邻两点**切成小段（见本文件 std::sort(..., ProjectionCompare(e)) 处）。
+//   不排序就无法正确地"沿边切分"。
+//
+// 参数：构造时传入参考边 m_e；operator() 接收两个待比较的点 a、b。
+// 返回：a 在 b 之前（即 a 的投影更靠 m_e.p1 一侧）时为 true。
+//
+// 实现：用标量积 sprod 计算 a、b 相对 m_e.p1 的投影长度（沿 m_e 方向），
+//       投影小者在前。投影相同时用点的字典序 (a < b) 打破平局 ——
+//       ★ 这个兜底是必要的，否则排序不构成严格弱序，切分顺序会不确定。
+//
+// 坑：sprod 是整数运算，结果精确无浮点误差；但正因如此，它对"投影恰好相等"
+//     的情形依赖 a < b 的确定性来保证可复现。
+// [[ZH-END]]
 struct ProjectionCompare
 {
+  // [[ZH]] 参数：e 参考边，投影沿 e 的方向（以 e.p1 为原点）度量。
   ProjectionCompare (const db::Edge &e)
     : m_e (e) { }
 
+  // [[ZH]] 功能：比较 a、b 沿 m_e 的投影长度。返回 true 表示 a 更靠近 m_e.p1。
   bool operator () (const db::Point &a, const db::Point &b) const
   {
+    // [[ZH]] sp1/sp2 = a、b 相对 m_e.p1 的投影（标量积），整数精确。
     db::coord_traits<db::Coord>::area_type sp1 = db::sprod (m_e, db::Edge (m_e.p1 (), a));
     db::coord_traits<db::Coord>::area_type sp2 = db::sprod (m_e, db::Edge (m_e.p1 (), b));
     if (sp1 != sp2) {
+      // [[ZH]] 投影不同：小者在前。
       return sp1 < sp2;
     } else {
+      // [[ZH]] 投影相同（例如两点对称）：用字典序兜底，保证严格弱序与结果确定。
       return a < b;
     }
   }
 
 private:
+  // [[ZH]] m_e：参考边，决定投影方向与原点。构造时固定，之后不变。
   db::Edge m_e;
 };
 
+// [[ZH-BEGIN]]
+// ⚠ 死代码提示：PolyMapCompare 在**整个代码库中已无任何引用**（定义在此，无人使用）。
+//   它是早期实现遗留的比较器，功能与现在在用的 EdgeXAtYCompare2 重叠。
+//   阅读时可以直接跳过；若将来要清理无用代码，这是一个候选。
+//   （用 grep "PolyMapCompare" 可自行确认只有本处定义。）
+// [[ZH-END]]
 struct PolyMapCompare
 {
   PolyMapCompare (db::Coord y)
@@ -123,6 +212,27 @@ private:
   db::Coord m_y;
 };
 
+// [[ZH-BEGIN]]
+// 功能：**精确**判断点 pt 是否在边 e 上（含端点，无容差）。
+//
+// ★ 与 db::edge::contains() 的区别（重要）：
+//     db::edge::contains()  带 ±1 DBU 容差，是"模糊"判断。
+//     本函数                 是**严格**判断 —— 一般位置的边要求叉积严格为 0。
+//   布尔运算内部必须区分"真正共线"与"仅仅近似共线"，否则会把不该合并的边合并，
+//   因此这里单独实现了精确版本。
+//
+// 参数：e 目标边；pt 待测点。
+// 返回：true = 点严格落在边（线段）上。
+//
+// 实现：
+//   ① 先用包围盒快速排除 —— 绝大多数点在此被排除，成本极低。
+//   ② 正交边（水平/垂直）走捷径：既然①已确认点在包围盒内，
+//      且边是水平或垂直的，那么点必然在线段上，直接返回 true（免去叉积）。
+//   ③ 一般情形：叉积符号为 0 即共线（配合①的包围盒约束，共线即在线段上）。
+//
+// 坑：对一般（非正交）边，这里的"精确"仅指**共线判断精确**；
+//     由于①的包围盒约束，判定的是"在线段上"而非"在无限直线上"。
+// [[ZH-END]]
 inline bool
 is_point_on_exact (const db::Edge &e, const db::Point &pt)
 {
@@ -143,6 +253,31 @@ is_point_on_exact (const db::Edge &e, const db::Point &pt)
   }
 }
 
+// [[ZH-BEGIN]]
+// 功能：**模糊**判断点 pt 是否在边 e 上 —— 允许 ±1 DBU 的偏差。
+//
+// ★ 与 is_point_on_exact 的分工：
+//   is_point_on_exact  → "真正共线"
+//   is_point_on_fuzzy  → "近共线"，即点在边旁边 1 个网格单位以内也算"在边上"
+//   阶段 2（求交）需要处理"看起来该相交、但整数网格上差了 1 DBU"的边，
+//   此时用模糊判定把它们当作相交，"吸附"到一起，避免出现几乎重合却不相交的碎片。
+//
+// 参数：e 目标边；pt 待测点。
+// 返回：true = 点在边的 ±1 DBU 邻域内（**不含端点**）。
+//
+// 实现：构造一个 ±1 的方向偏移向量 offset，比较"点到边的有向面积"与
+//       "offset 到边的有向面积"的大小关系，从而判定点是否落在
+//       边两侧 1 DBU 的**锥形邻域**内。
+//       当边朝左上/右下时用 offset = (1,1)，否则用 (-1,1)，
+//       以保证偏移方向指向边的"内侧"。
+//
+// 坑：1) ★ 本函数**排除端点**（开头就有 pt == e.p1() || pt == e.p2() 的检查）——
+//        这与 is_point_on_exact 不同。若你把两者混用，会在端点处得到不一致的结论。
+//     2) 这里的"1 DBU 锥形邻域"是**有方向性**的（依赖 offset 的选取），
+//        不是严格的欧氏圆邻域 —— 这是为了配合整数网格的取舍而做的设计，
+//        也是设计上最微妙的一处近似。
+//     3) 正交边同样走捷径直接返回 true（因为包围盒已确认点在边上）。
+// [[ZH-END]]
 inline bool
 is_point_on_fuzzy (const db::Edge &e, const db::Point &pt)
 {
@@ -194,6 +329,28 @@ is_point_on_fuzzy (const db::Edge &e, const db::Point &pt)
 //  A intersection test that is more robust numerically.
 //  In some cases (i.e. (3,-3;-8,-1) and (-4,-2;13,-4)), the intersection test gives different results
 //  for the intersection point if the edges are swapped. This test is robust since it operates on ordered edges.
+// [[ZH-BEGIN]]
+// 功能：求两边的交点，且**保证结果与参数顺序无关**。
+//
+// ★ 为什么需要这个包装（这是本文件最容易被低估的一个函数）：
+//   db::edge::intersect_point() 的实现在某些输入下**不是对称的** ——
+//   e1.intersect_point(e2) 与 e2.intersect_point(e1) 可能给出不同的坐标
+//   （上面的英文注释举了具体例子：(3,-3;-8,-1) 与 (-4,-2;13,-4)）。
+//   原因是内部走的是"以某条边为基准算叉积比值"的不对称公式。
+//
+//   后果：如果一个地方按 (e1,e2) 调用、另一个地方按 (e2,e1) 调用，
+//   同一个交点会得到两个不同坐标 → 边在同一处被切成错位的两段 →
+//   scanline 排序不稳定 → 布尔运算结果出现拓扑错误（且极难复现）。
+//
+//   解决：统一按**边的全序**（operator<）固定调用顺序。
+//   这样无论调用者传参顺序如何，内部总是以同一个顺序求交，结果必然一致。
+//
+// 参数：e1、e2 两条边（顺序无关）。
+// 返回：std::pair<bool, db::Point>，语义同 db::edge::intersect_point()。
+//
+// 用法约定：本文件（以及全库）在阶段 2 求交时**一律**通过本函数求交，
+//           不要直接调用 intersect_point，以免破坏上述一致性保证。
+// [[ZH-END]]
 inline std::pair<bool, db::Point> safe_intersect_point (const db::Edge &e1, const db::Edge &e2)
 {
   if (e1 < e2) {
@@ -211,26 +368,100 @@ inline std::pair<bool, db::Point> safe_intersect_point (const db::Edge &e1, cons
  *  cutpoints (strong_cutpoints), they will change the edge, hence non-cutpoints (attractors) must be
  *  included. 
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  CutPoints —— 一条边上的"待切分点"清单（阶段 1-3 的核心数据结构）
+// ============================================================================
+//
+// 【背景】阶段 2 求交后，必须把每条边在交点处"打断"，使所有小段互不相交，
+//   阶段 4 的扫描线才能按顺序处理。CutPoints 就是"某条边要在哪些点被打断"的记录。
+//
+// 【两种点：strong 与 weak(attractor)】★ 这是本结构最微妙的设计
+//   cut_points    强切点：**确定**要在此处打断这条边。
+//   attractors    弱切点（吸引点）：暂时只是"记下"，**先不打断**。
+//                 每个元素是 (点, 另一条边的 CutPoints 下标)。
+//
+//   为什么需要 weak？考虑两条边 A、B 在整数网格下"几乎相交但差 1 DBU"：
+//   求交时可能只能判定"B 的端点落在 A 的附近"，却无法确认交点。
+//   如果立刻把 A 打断，会切断一段本不该断的边（产生碎片）；
+//   如果完全不记，之后 B 真的被别的边打断时，A 这边就漏了一个切点。
+//   于是采用"延迟决策"：先在 A 上记一个 attractor 指向 B。
+//
+// 【提升(promotion)机制】当 A 上出现了一个**强**切点（strong_cutpoints 变为 true），
+//   说明 A 确实要被切分了；此时 `add()` 会把此前攒下的所有 attractors
+//   **反向传播**回它们各自所属的那条边（用记录的下标找到对方），把它们提升为强切点。
+//   这样两边的切分保持一致，不会出现"一边断了、另一边没断"的错位。
+//
+// 【两个标志位】
+//   has_cutpoints    : 这条边是否至少记录过一个点（无论强弱）。
+//   strong_cutpoints : 这条边是否已有**强**切点（即确定要被打断）。
+//                      它决定 add_attractor() 是"直接成为切点"还是"先记为弱切点"。
+//
+// 注意：本结构只服务于阶段 1-3；阶段 4 会复用 WorkEdge::data 字段存别的东西。
+// [[ZH-END]]
 struct CutPoints
 {
+  // [[ZH]] cut_points：强切点列表 —— 这条边将在这些点处被切断。
+  // [[ZH]]             阶段 3 会沿边方向排序后，在相邻两点间生成小段。
   std::vector <db::Point> cut_points;
+  // [[ZH]] attractors：弱切点列表，元素为 (点, 对方边的 CutPoints 下标)。
+  // [[ZH]]             记下"可能需要的切点"以及"该回溯通知谁"，
+  // [[ZH]]             等本方出现强切点时再统一提升，见 add()。
   std::vector <std::pair<db::Point, size_t> > attractors;
+  // [[ZH]] has_cutpoints：是否记录过任何点（强弱皆算）。
+  // [[ZH]] 注意：它用位域 : 8 声明（占 8 bit），是历史写法，语义上就是一个 bool。
   bool has_cutpoints : 8;
+  // [[ZH]] strong_cutpoints：是否已有强切点（即确定要被打断）。
+  // [[ZH]] 决定 add_attractor() 的行为分支，见下。
   bool strong_cutpoints : 8;
 
+  // [[ZH]] 功能：构造空的切点清单（两个标志位均为 false）。
   CutPoints ()
     : has_cutpoints (false), strong_cutpoints (false)
   { }
 
+  // [[ZH-BEGIN]]
+  // 功能：登记一个**弱**切点（attractor）。
+  // 参数：p    待记录的点；
+  //       next 对方边的 CutPoints 下标 —— 用于日后反向提升时找到对方。
+  // 行为：· 若本方**已有强切点**（strong_cutpoints == true），
+  //         说明本方确定要被打断，这个点应当直接成为真正的切点 → 进 cut_points。
+  //       · 否则先存进 attractors，连同 next 下标，等待日后提升。
+  // 副作用：可能修改 cut_points 或 attractors。
+  // [[ZH-END]]
   void add_attractor (const db::Point &p, size_t next)
   {
     if (strong_cutpoints) {
+      // [[ZH]] 本方已在切分状态 → 该点直接成为正式切点。
       cut_points.push_back (p);
     } else {
+      // [[ZH]] 否则先"挂起"，记录对方下标，等本方出现强切点时再提升。
       attractors.push_back (std::make_pair (p, next));
     }
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：登记一个切点 p，并（在必要时）触发弱切点的反向提升。
+  //
+  // 参数：p        切点坐标；
+  //       cpvector 全体边的 CutPoints 数组 —— 提升时需要它按下标找到对方边；
+  //       strong   该点是否为**强**切点（默认 true）。
+  //
+  // 副作用（★ 这是本函数的关键，不只是"加一个点"）：
+  //   ① 置 has_cutpoints = true。
+  //   ② 若这是本方的**第一个强切点**（strong && !strong_cutpoints）：
+  //        置 strong_cutpoints = true，
+  //        并把此前攒下的**所有 attractors 反向提升**为各自所属边的强切点 ——
+  //        通过 attractor 里记录的下标，在 cpvector 中找到对方边并对其调用 add(...)。
+  //        这样保证"一方确定切分"时，另一方对应的点也同步成为切分点，两边不错位。
+  //        注意实现里先把 attractors 交换到局部变量 attr 再遍历，
+  //        以**避免边遍历边修改自身容器**导致迭代器失效/无限递归。
+  //   ③ 去重：若 cut_points 中已存在同坐标的点，直接返回（不重复插入）。
+  //        这一步是必要的，否则重复切点会产生零长度碎片边。
+  //
+  // 坑：提升是**递归**的（对方边 add 时也可能触发它自己的提升），
+  //     但因③的去重与②的"仅首个强切点触发"两个条件，递归会收敛。
+  // [[ZH-END]]
   void add (const db::Point &p, std::vector <CutPoints> *cpvector, bool strong = true)
   {
     has_cutpoints = true;
@@ -239,10 +470,12 @@ struct CutPoints
       strong_cutpoints = true;
       if (! attractors.empty ()) {
 
+        // [[ZH]] 先整体取出，避免遍历 attractors 的同时又修改它（自我修改风险）。
         std::vector <std::pair<db::Point, size_t> > attr;
         attractors.swap (attr);
 
         cut_points.reserve (cut_points.size () + attr.size ());
+        // [[ZH]] 反向提升：按记录的下标找到对方边的 CutPoints，把点也加入对方。
         for (std::vector <std::pair<db::Point, size_t> >::const_iterator a = attr.begin (); a != attr.end (); ++a) {
           (*cpvector) [a->second].add (a->first, cpvector, true);
         }
@@ -252,6 +485,7 @@ struct CutPoints
     } 
 
     //  do not insert points twice
+    // [[ZH]] ③ 去重：同坐标的切点只保留一个，避免产生零长度碎片边。
     for (auto c = cut_points.begin (); c != cut_points.end (); ++c) {
       if (*c == p) {
         return;
@@ -267,21 +501,54 @@ struct CutPoints
 /**
  *  @brief A data object for the scanline algorithm
  */
+// [[ZH-BEGIN]]
+// 功能：算法内部使用的边记录 —— 在 db::Edge（两个端点）之上挂了两项附加数据。
+//       阶段 2、3、4 处理的都是 WorkEdge 而不是裸的 db::Edge。
+//
+// 继承关系：public db::Edge，因此所有边的几何操作（dx/dy/swap_points/
+//           intersect_point/operator< ...）都可以直接调用，无需转换。
+//
+// 【★ 两个附加字段，注意 data 的含义会"换岗"】
+//   prop : 这条边的来源标签（property）。全生命周期含义固定，
+//          由 insert() 时传入，评估器靠它区分不同输入多边形/图层。
+//
+//   data : ★ 含义随阶段变化，这是本结构最容易读错的地方：
+//            · 阶段 1-3：存放本边 CutPoints 在 mp_cpvector 中的**下标 + 1**
+//                        （0 表示"尚无 CutPoints"，故用 +1 让 0 可表示"无"）。
+//                        由 make_cutpoints() 惰性分配。
+//            · 阶段 4  ：改存 skip 优化信息的下标（SkipInfo 的条目号）。
+//            所以不能跨阶段假设 data 的语义；阶段 4 开始前代码里还有
+//            `tl_assert (future->data == 0)` 之类的断言来确认这一点。
+//
+// 【为什么用"下标 + 1"而不是指针】
+//   CutPoints 存放在 std::vector 中，扩容会使其中的元素地址失效。
+//   用下标可以安全地在 vector 增长后重新寻址；且 vector 紧凑、缓存友好。
+//
+// 坑：拷贝构造与赋值**都被显式实现**了 —— 因为默认的成员逐一拷贝对本类是正确的，
+//     但作者仍显式写出以明确意图（并确保 data/prop 一并复制）。
+//     注意 operator= (const db::Edge &) 的重载**只复制几何**，
+//     会把 data/prop 留在原值 —— 这是刻意的（用于仅替换几何的场合）。
+// [[ZH-END]]
 struct WorkEdge
   : public db::Edge
 {
+  // [[ZH]] 功能：默认构造 —— 退化的零长度边，data = 0（无 CutPoints），prop = 0。
   WorkEdge () 
     : db::Edge (), data (0), prop (0)
   { }
 
+  // [[ZH]] 功能：由几何边 + 来源标签构造。
+  // [[ZH]] 参数：e 几何；p 来源标签(property)；d 初始 data（通常是 CutPoints 下标+1，默认 0=无）。
   WorkEdge (const db::Edge &e, EdgeProcessor::property_type p = 0, size_t d = 0) 
     : db::Edge (e), data (d), prop (p)
   { }
 
+  // [[ZH]] 功能：拷贝构造 —— 几何、data、prop 全部复制。
   WorkEdge (const WorkEdge &d)
     : db::Edge (d), data (d.data), prop (d.prop)
   { }
 
+  // [[ZH]] 功能：赋值 —— 复制全部三项。带自赋值检查。
   WorkEdge &operator= (const WorkEdge &d)
   { 
     if (this != &d) {
@@ -292,22 +559,42 @@ struct WorkEdge
     return *this;
   }
 
+  // [[ZH]] 功能：**只**替换几何部分，保留 data / prop 不变。
+  // [[ZH]] 用途：当只想更新边的位置（例如打断后替换成某一段）而保留其
+  // [[ZH]]       来源标签与切点关联时使用。
   WorkEdge &operator= (const db::Edge &d)
   { 
     db::Edge::operator= (d);
     return *this;
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：取得本边对应的 CutPoints 对象；若尚未分配则**惰性分配**一个。
+  //
+  // 参数：cutpoints 全局的 CutPoints 数组（每条边一项，惰性增长）。
+  // 返回：指向本边 CutPoints 的**指针**。
+  //
+  // 实现：data == 0 表示"尚未分配" → 向 cutpoints 追加一个空 CutPoints，
+  //       并把 `下标 + 1` 存进 data（+1 是为了让 0 能表示"无"）。
+  //       data != 0 时直接用 data - 1 索引。
+  //
+  // 注意：返回的是 vector 内部元素的指针 —— 若之后 cutpoints 再次扩容，
+  //       该指针可能失效。因此调用者应在拿到的指针上**立即**使用，
+  //       不要长期持有（这也是本文件在阶段 3 尽快用掉它的原因）。
+  // [[ZH-END]]
   CutPoints *make_cutpoints (std::vector <CutPoints> &cutpoints)
   {
     if (! data) {
+      // [[ZH]] 惰性分配：追加一项，并记录 下标+1（使 0 可表示"无"）。
       cutpoints.push_back (CutPoints ());
       data = cutpoints.size ();
     }
     return &cutpoints [data - 1];
   }
 
+  // [[ZH]] data：阶段 1-3 = CutPoints 下标+1（0 = 无）；阶段 4 = skip 信息下标。见上面说明。
   size_t data;
+  // [[ZH]] prop：边的来源标签(property)，全生命周期语义固定，供评估器区分不同输入。
   db::EdgeProcessor::property_type prop;
 };
 
