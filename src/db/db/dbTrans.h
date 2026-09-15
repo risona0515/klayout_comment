@@ -42,6 +42,68 @@ namespace tl {
 
 namespace db {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbTrans.h —— 坐标变换（transformation）体系
+// ============================================================================
+//
+// 【这个文件解决什么问题】
+//   版图里同一个单元会被**反复以不同位置/朝向**引用（层层嵌套）。
+//   与其把几何数据复制到每个位置，不如只存一个变换 —— 显示/运算时再套用。
+//   变换就是「旋转 + 镜像 + 位移（+ 缩放）」的组合。
+//
+// 【★ 五个变换类的分工（本文件的核心结构，看懂这张表就懂了本文件）】
+//   命名规律：名字越具体，能力越弱 —— 这是一种“用类型表达约束”的设计，
+//   让编译器帮你保证“这个变换确实够用”。
+//
+//     unit_trans<C>    恒等变换（什么都不做）
+//                      最快；用于“这个引用没有变换”的场合。
+//
+//     disp_trans<C>    仅位移（不旋转、不镜像）
+//                      ★ 没有“角度”字段，因此天然不会引入舍入误差。
+//
+//     fixpoint_trans<C> 位移 + 90° 的整数倍旋转 + 镜像（**定点变换**）
+//                      所谓“定点”指旋转只绕 90° 的倍数，
+//                      因此坐标仍是整数，不会有精度损失。
+//
+//     simple_trans<C>  ★ 最常用（typedef 为 db::Trans）
+//                      位移 + 90° 整数倍旋转 + 镜像。
+//                      它与 fixpoint_trans 的区别在于**内部表示与语义约定**
+//                      （见下面 simple_trans 处的说明），不要混用。
+//
+//     complex_trans<I,F,R>  ★ 能力最强
+//                      位移 + **任意角度**旋转 + 镜像 + **缩放(magnification)**。
+//                      三个模板参数分别控制输入/输出坐标类型与内部浮点类型：
+//                        I = 输入坐标类型（被变换的坐标）
+//                        F = 输出坐标类型
+//                        R = 内部计算用的浮点类型（默认 double）
+//                      ★ 因为支持任意角度与缩放，**会产生舍入误差** ——
+//                        这是它与前四者的本质差别。
+//
+// 【★ 与“边的方向”约定的关系（与 dbEdge.h 呼应的关键点）】
+//   镜像会翻转手性。为了让“边的右侧 = 多边形内部”这一约定在变换后仍然成立，
+//   db::edge::transform 遇到镜像变换时会**交换边的两个端点**（见 dbEdge.h）。
+//   因此变换**不是**与几何无关的“换个坐标看”那么简单：
+//   它必须与边的方向语义协同工作。这一点在阅读所有 transform 相关代码时都要记住。
+//
+// 【成员函数名的含义（各变换类共用同一套接口）】
+//   is_mirror()   是否含镜像
+//   is_unity()    是否为恒等（可以安全跳过）
+//   is_ortho()    旋转是否仅为 90° 的倍数（= 不会引入舍入误差）
+//   is_mag()      是否含缩放
+//   rot()         旋转码（0..3 表示 0°/90°/180°/270°）
+//   disp()        位移量（vector）
+//   mag()         缩放倍率（仅 complex_trans）
+//   invert()      求逆变换
+//   apply(p) / operator*   作用在点/向量/其它几何上
+//   * 组合（乘法）：两个变换相乘 = 依次施加（注意顺序，见各 operator* 的说明）
+//
+// 【为什么没有统一的基类】
+//   各变换是**独立的模板类**，不是继承体系 —— 因为它们的数据成员与
+//   “能做什么”都不同（例如 disp_trans 没有角度字段）。
+//   库靠**统一的方法名**而非继承来实现互换使用（静态多态）。
+//   这也是为什么模板参数（如 insert_with_trans<Trans>）能接受任意一种变换。
+// [[ZH-END]]
 template <class I, class F, class R = double> class DB_PUBLIC_TEMPLATE complex_trans;
 template <class C> class DB_PUBLIC_TEMPLATE simple_trans;
 template <class C> class DB_PUBLIC_TEMPLATE disp_trans;
@@ -1109,6 +1171,43 @@ operator<< (std::ostream &os, const disp_trans<C> &t)
   return (os << t.to_string ());
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  simple_trans<C> —— ★ 最常用的变换（typedef 为 db::Trans）
+// ============================================================================
+//
+// 【能力】位移 + 90° 整数倍旋转 + 镜像。
+//         ★ **不能**做任意角度旋转或缩放 —— 那是 complex_trans 的活。
+//         正因如此它**不会引入任何舍入误差**，这是它成为默认选择的原因。
+//
+// 【★ 与 fixpoint_trans 的关系（容易混淆，务必看清）】
+//   本类是 **public 继承** fixpoint_trans<C>，即：
+//        simple_trans = fixpoint_trans（旋转+镜像） + 额外的位移向量 m_u
+//   两者都叫“定点变换”，差别在**位移的表示与用途**：
+//     · fixpoint_trans 用“定点坐标 (x,y)”来表示位移：
+//         变换语义是“将图形绕点 (x,y) 镜像/旋转”，因此在做变换时，
+//         必须先平移到原点、再旋转、再平移回去 —— 实现上需要额外的减法。
+//     · simple_trans 额外带一个**位移向量 m_u**：
+//         语义直接就是“先旋转/镜像，再按 m_u 平移”。
+//   所以 simple_trans 比 fixpoint_trans 多一次加法，但语义更直白。
+//   ★ 实际使用中几乎总是用 simple_trans（db::Trans）；
+//     fixpoint_trans（db::FTrans）主要用于表示“绕某点”的几何操作。
+//
+// 【内部数据】
+//   继承自 fixpoint_trans：旋转码 + 镜像标志 + 定点坐标
+//   自身追加：m_u —— 位移向量（displacement）
+//
+// 【与 dbEdge.h 的呼应（重要）】
+//   因为本类可以含镜像，而镜像会翻转手性，
+//   所以 db::edge::transform 在 is_mirror() 为真时会**交换边的两个端点**，
+//   以维持“边的右侧 = 多边形内部”的约定。
+//   换句话说：利用本类变换几何时，方向语义是被自动照顾的 ——
+//   但这只在通过几何类的 transform() 方法时才成立；
+//   若你直接拿矩阵去乘点，就要自己注意方向问题。
+//
+// 【逆变换】inverse_trans typedef 指向自身 —— 因为本类是**自逆类型**：
+//   它的 invert() 返回同类型（simple_trans 的逆仍是 simple_trans）。
+// [[ZH-END]]
 /**
  *  @brief A simple transformation
  *
@@ -1121,15 +1220,21 @@ class DB_PUBLIC_TEMPLATE simple_trans
   : public fixpoint_trans<C>
 {
 public:
+  // [[ZH]] 配套类型别名。注意 target_coord_type == C（输入输出同类型），
+  // [[ZH]] 这是“不会引入跨类型舍入”的表现。
   typedef C coord_type;
   typedef C target_coord_type;
   typedef typename coord_traits<C>::distance_type distance_type;
   typedef vector<C> displacement_type;
+  // [[ZH]] inverse_trans 指向自身 —— 本类是自逆类型（见上方说明）。
   typedef simple_trans<C> inverse_trans;
 
   /**
    *  @brief The default constructor (unity transformation)
    */
+  // [[ZH]] 功能：构造**恒等变换**（旋转码 0、无镜像、位移 (0,0)）。
+  // [[ZH]] 提示：默认构造即恒等 —— 与 box 不同（box 默认是“空”），
+  // [[ZH]]       这里没有“无效变换”这种状态。
   simple_trans ()
     : fixpoint_trans<C> (0), m_u ()
   {
@@ -1549,6 +1654,47 @@ operator<< (std::ostream &os, const simple_trans<C> &t)
  *  type used internally for representing the floating-point members).
  */
 template <class I, class F, class R>
+// [[ZH-BEGIN]]
+// ============================================================================
+//  complex_trans<I, F, R> —— ★★ 能力最强的变换（任意角度 + 缩放）
+// ============================================================================
+//
+// 【与 simple_trans 的本质差别】
+//   simple_trans 只能 90° 整数倍旋转（无舍入）；
+//   本类支持**任意角度旋转**与**缩放(magnification)**，
+//   代价是必须用浮点三角函数表示，**因此会引入舍入误差**。
+//
+// 【★★ 三个模板参数的含义（这是理解本类的关键）】
+//     I =  **输入**坐标类型（被变换的坐标）
+//     F =  **输出**坐标类型（变换后的坐标）
+//     R =  内部计算用的浮点类型（默认 double）
+//
+//   为什么需要区分输入/输出类型 —— 因为“任意角度旋转”会产生小数坐标：
+//     · CplxTrans = complex_trans<Coord, DCoord>
+//         整数输入 → **浮点输出**：保留子 DBU 精度，不丢信息。
+//         ★ 需要“连续施加多次任意角度变换”时应选它，否则每次舍入都会累积误差。
+//     · ICplxTrans = complex_trans<Coord, Coord>
+//         整数输入 → 整数输出：**输出会舍入到 DBU**。
+//         适合“结果必须落回版图网格”的场景，但重复变换会累积舍入误差。
+//     · VCplxTrans = complex_trans<DCoord, Coord>
+//         浮点输入 → 整数输出（“逆方向”）。
+//
+//   还有一点值得注意：inverse_trans 是 **complex_trans<F, I, R>**（注意 I/F 互换）——
+//   因为逆变换要把输出类型转回输入类型。这与 simple_trans 的“自逆”不同。
+//
+// 【内部表示：为什么存 sin/cos 而不是存角度】
+//   成员是 m_cos、m_sin、m_mag（缩放），而**不是**一个角度值。
+//   原因：每次作用到坐标上都要用 cos/sin，存三角函数值可以避免每次重算；
+//   且组合（相乘）两个变换时用三角恒等式直接算出新的 sin/cos，无需反三角函数。
+//   ★ 镜像的实现很巧妙：镜像不单独存标志，而是让 m_mag 为 **-1**
+//     （见下面从 fixpoint 转换的构造函数：`m_mag = f.is_mirror () ? -1.0 : 1.0`）。
+//     因此“负缩放”在本类中就等于镜像 —— 这点在调试时容易困惑。
+//
+// 【恒等变换的表示】m_sin = 0, m_cos = 1, m_mag = 1（见默认构造函数）。
+//
+// 【与 dbEdge.h 的呼应】本类也可含镜像（m_mag < 0），
+//   因此通过几何类的 transform() 施加它时，边的两个端点会被交换。
+// [[ZH-END]]
 class DB_PUBLIC_TEMPLATE complex_trans
 {
 public:
@@ -2519,6 +2665,41 @@ operator<< (std::ostream &os, const combined_trans<T1, T2> &t)
   return (os << t.to_string ());
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  本组 typedef —— 实际写代码时用的变换类型名
+// ============================================================================
+//
+// ★ 命名规律（记不住具体名字时可用它推断）：
+//     D 前缀  → 使用 double 坐标（DCoord）
+//     大写 I 在开头（ICplxTrans）→ 整数到整数的复杂变换
+//     无前缀   → 整数坐标（Coord）
+//
+//   名称          类                   坐标/能力                         典型用途
+//   ----------    ------------------   -------------------------------   ------------------
+//   UnitTrans     unit_trans           恒等                               无变换的引用
+//   DUnitTrans    unit_trans<DCoord>   恒等（浮点）                       同上，浮点场景
+//   FTrans        fixpoint_trans       位移+90°旋转+镜像（定点）          引用变换（精确）
+//   DFTrans       fixpoint_trans<D>    同上（浮点）                       同上
+//   Disp          disp_trans           仅位移（无角度→无舍入）           平移、数组步进
+//   DDisp         disp_trans<DCoord>   仅位移（浮点）                     同上
+//   Trans     ★   simple_trans         ★ 位移+90°旋转+镜像（**最常用**）   引用变换的默认选择
+//   DTrans        simple_trans<D>      同上（浮点）                       同上
+//   ICplxTrans    complex_trans<C,C>   ★★ 任意角度+缩放，整数输入整数输出  ★ 会把结果舍入到 DBU
+//   CplxTrans     complex_trans<C,D>   任意角度+缩放，整数输入浮点输出       需要保留子 DBU 精度时
+//   VCplxTrans    complex_trans<D,C>   同上反向（浮点输入整数输出）         测量/导入场景
+//
+// 【重点区分 Trans 与 ICplxTrans —— 最容易选错的两个】
+//   Trans     只能 90° 倍数旋转，**不会引入任何误差**。
+//             ★ 版图引用（instance）的变换几乎总是用它 —— 因为版图引用
+//               通常只允许 90° 倍数旋转，且必须精确可复现。
+//   ICplxTrans 支持任意角度与缩放，但**输出要舍入到整数网格**，
+//             因此变换后的坐标会有舍入误差（同一图形变换两次可能不等于一次）。
+//             适合“用户显式要求任意角度/缩放”的场景。
+//
+// 注意：下面还给出两个 operator* 特化（CplxTrans 与 VCplxTrans 的组合）。
+//   它们解决的是“输入输出类型不兼容时如何组合”的问题（见英文注释）。
+// [[ZH-END]]
 /**
  *  @brief The standard unit transformation
  */
