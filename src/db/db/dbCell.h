@@ -69,6 +69,49 @@ class PCellDeclaration;
  *  The cell index is valid in the context of a layout object which
  *  must issue the cell index.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **单元 (cell)** —— 版图层次结构里的一个节点（相当于 GDS 里的一个 structure）。
+//
+// 【它包含什么】向上英文注释已列出，展开说明：
+//     1) **一组图形容器（按层）** —— 即 db::Shapes 的集合，
+//        每个 layer index 对应一个 Shapes（见 dbShapes.h）。
+//        ★ 即“某个 cell 在某一层上画了哪些图形”。
+//     2) **一组子 cell 的实例引用 (Instance)** —— 指向其它 Cell，
+//        并带变换（位置/旋转/镜像）。★ 这就是层次结构的由来：
+//        Cell 之间通过 Instance 相连，构成有向图（正常是 DAG）。
+//     3) **辅助信息**，例如**父实例列表**（谁引用了我）——
+//        这让“向上查找”（找所有引用者）成为可能，不必全库扫描。
+//     4) **一个 cell index** —— 见下面的重要说明。
+//
+// 【★★ cell index 的语义（容易误解，务必看清）】
+//   上面英文说：“A cell is identified through an index... The cell index is
+//   valid in the context of a layout object which must issue the cell index.”
+//   要点：
+//     · cell index 是**整数索引**，不是指针/句柄；
+//     · 它只在**发放它的那个 Layout 内部**有效 ——
+//       把 A 库的 index 用到 B 库上会取到完全不相干的 cell（且不报错）；
+//     · index 由 Layout 分配，因此**不能自己构造**，必须问 Layout 要；
+//     · ★ 删除 cell 可能使其它 cell 的 index 变化，
+//       因此跨删除操作长期保存 index 有风险。
+//
+// 【与父实例的关系（初学者容易困惑的反转）】
+//   Instance 属于**父 cell**，但指向**子 cell**。
+//   因此：
+//     · 向下（我引用了谁）：遍历本 cell 的 instance 列表；
+//     · 向上（谁引用了我）：遍历本 cell 的**父实例列表**。
+//   遍历层次时两种方向都要用（如“递归展开”用向下、“找唯一调用者”用向上）。
+//
+// 【★ 每个 cell 还有一个 bbox_cache】
+//   Cell 缓存自己的包围盒，避免每次重算。★ 因此**改了图形必须让缓存失效** ——
+//   这正是 Layout::start_changes()/end_changes() 那套事务协议要解决的
+//   （见 dbLayout.h 的说明）。跳过事务协议会导致缓存与数据不一致。
+//
+// 【层次结构（与 Layout/Shapes/Shape 的关系）】
+//     db::Layout
+//       └─ db::Cell                ← 本文件
+//            ├─ db::Shapes (每层一个) → db::Shape
+//            └─ db::Instance[]       → 指向其它 db::Cell
+// [[ZH-END]]
 
 class DB_PUBLIC Cell
   : public db::Object,

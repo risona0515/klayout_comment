@@ -522,6 +522,48 @@ public:
  *  the various begin.. and end.. methods that are specialized on
  *  a certain shape type.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **一层上的所有图形** —— db::Shapes 就是“某个 cell 在某一层的图形集合”。
+//
+// 【★★ 本类最反直觉的设计：按“图形类型”分多个子容器（务必先理解这点）】
+//   上面英文注释点出了核心思想，展开说明：
+//     · 一般你会以为 Shapes 是“一个装着各种图形的列表”；
+//       实际上它是**若干个按图形类型分开的容器**的组合：
+//           boxes       一批矩形
+//           polygons    一批多边形
+//           paths       一批路径
+//           texts       一批文本
+//           (+ 还有各自的 ref/array 等变体)
+//     · 为什么这么设计：图形类型不同则存储方式不同（box 只要两个角点，
+//       polygon 要一列点），混在一起存储会浪费内存且遍历效率低；
+//       而**实际使用中很少需要同时操作多种类型**。
+//     · 因此 API 不是“拿一个万能迭代器”，而是**按类型分别取迭代器**：
+//           for (auto b = shapes.begin_boxes(); ...)     // 只遍历矩形
+//           for (auto p = shapes.begin_polygons(); ...)  // 只遍历多边形
+//       这就是上面说的 “begin.. / end.. methods specialized on a certain shape type”。
+//   ★ 实用结论：**遍历某层的图形时，必须明确你要哪种类型**，
+//     并可能需要分别遍历多次（矩形一次、多边形一次……）。
+//     没有“一个循环走遍所有类型”的简单写法 —— 这是刻意的性能取舍。
+//
+// 【为什么用 db::Shape 迭代器而不是直接给对象】
+//   begin_* 返回的迭代器解引用得到的是 db::Shape（**句柄**，不是几何对象）。
+//   见 dbShape.h：句柄廉价、不拥有数据、可能失效。
+//   需要几何时才调 s->polygon() / s->box() 等展开它。
+//
+// 【在多层的层次结构里它对应什么】
+//     db::Cell 的每一层有一个 db::Shapes
+//        ↓ 按类型取迭代器
+//     db::Shape（句柄）→ 展开成 db::Box / Polygon / Path / Text
+//   ★ 注意：layer index 是访问 Shapes 的键 ——
+//     先“按层号/层名查到 layer index”，再用 layout 的 cell.shapes(layer_index)
+//     取得该层的 Shapes。
+//
+// 【性能提示（与使用方式直接相关）】
+//   · 只请求你需要的类型（别为了“保险”把所有类型都遍历一遍）。
+//   · 图形很多时考虑用 db::Region 一次性做几何运算，而不是逐个 Shape 处理 ——
+//     Region 内部会做层次化与批量优化（见 dbRegion.h）。
+//   · 修改后同样受 Layout 的事务协议约束（缓存一致性，见 dbLayout.h）。
+// [[ZH-END]]
 
 class DB_PUBLIC Shapes 
   : public db::Object
