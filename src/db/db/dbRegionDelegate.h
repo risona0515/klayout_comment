@@ -54,16 +54,60 @@ class Net;
 /**
  *  @brief A base class for polygon filters
  */
+// [[ZH-BEGIN]]
+// 功能：★ **多边形过滤器**的抽象基类 —— `Region::filtered(...)` 用它挑选多边形。
+//
+// 【它解决什么问题】
+//   常需要“从区域里挑出符合条件的一部分多边形”，例如：
+//     · 属性 net 等于 "VDD" 的多边形；
+//     · 面积大于某阈值的多边形；
+//     · 位于某框内/外的多边形。
+//   若为每种条件都加一个 Region 方法会爆炸，因此改成“**过滤器对象**”模式：
+//       region.filtered (my_filter)   → 返回只含被选中多边形的 Region
+//   你只需实现本类，即可复用整套集合运算基础设施。
+//
+// 【★ 需要实现的方法（全是纯虚函数）】
+//   selected (polygon, prop_id)       —— ★ 核心：该多边形是否选中
+//   selected (polygon_ref, prop_id)   —— 同上，但输入是“引用+变换”形态
+//   selected_set (set_of_polygons)    —— 同上，但一次看**一整组**（可看整体属性）
+//   selected_set (set_of_refs)        —— 同上
+//   vars ()                           —— 与“单元变体 (variants)”相关的变换归约器
+//   requires_raw_input ()             —— ★ 是否需要**未合并**的输入
+//   wants_variants ()                 —— 是否想生成变体
+//
+// 【★★ 三个容易忽略但重要的点】
+//   1) **有 4 个 selected 重载，不是 1 个**：
+//      因为多边形的存在形态不同（平铺值 / 引用+变换 / 成组、带整体属性），
+//      过滤逻辑在每种形态下取数据的方式不同。
+//      ★ 通常你只需真正实现其中一个、其余转发或返回同一判断，
+//        但**必须都实现**（纯虚）。
+//   2) **prop_id 参数是给“属性过滤”用的**：
+//      过滤器可能只关心几何、也可能按属性挑；属性值本身在仓库里
+//      （见 dbPropertiesRepository.h），这里只给 ID。
+//   3) **requires_raw_input () 会改变“喂给你的数据”**：
+//      ★ 返回 true 时，库会传**未合并 (non-merged)** 的多边形给你；
+//        返回 false 则通常传已合并的。
+//      含义：若你的判断依赖“原始多边形边界”（例如想看到重叠），
+//        就要返回 true；若只关心最终覆盖区域，用 false（更快）。
+//      —— 这是本类唯一会影响**性能与语义**的开关，别忽略。
+//
+// 【与 Region 的配合】
+//   用户看到的入口是 db::Region::filtered()；本类的派生类由库内置提供
+//   （如按属性/按面积过滤），也可由脚本自定义。
+// [[ZH-END]]
 class DB_PUBLIC PolygonFilterBase
 {
 public:
+  // [[ZH]] shape_type = db::Polygon —— 本过滤器处理的对象类型。
   typedef db::Polygon shape_type;
 
   /**
    *  @brief Constructor
    */
+  // [[ZH]] 功能：构造（无状态基类，派生类自行保存过滤条件）。
   PolygonFilterBase () { }
 
+  // [[ZH]] 虚析构：允许通过基类指针删除派生过滤器。
   virtual ~PolygonFilterBase () { }
 
   /**
@@ -120,6 +164,39 @@ typedef db::generic_shape_iterator_delegate_base <db::Polygon> RegionIteratorDel
 /**
  *  @brief The delegate for the actual region implementation
  */
+// [[ZH-BEGIN]]
+// 功能：★★ **Region 的委托接口** —— 这个抽象类定义了“一个区域实现必须能做什么”。
+//
+// 【★ 它在架构中的位置（与 dbShapeCollection.h / dbRegion.h 呼应）】
+//       db::Region                     ← 门面（用户用的对象，很小）
+//          └─ mp_delegate → RegionDelegate   ★ 本类：抽象接口
+//                 ├─ db::FlatRegion        平铺实现
+//                 ├─ db::DeepRegion        层次化实现（不展开）
+//                 ├─ db::EmptyRegion       空实现（惰性）
+//                 ├─ db::MutableRegion     可修改包装
+//                 ├─ db::AsIfFlatRegion    按需展开但表现为平铺
+//                 └─ db::OriginalLayerRegion  直接指向版图某层
+//   ★ 因此：**看本类的方法列表 = 看“一个 Region 能做什么”的完整能力清单**。
+//     Region 门面上的每个操作，最终都转发到这里某个虚函数。
+//
+// 【★ 从继承链看它的身份】
+//   public db::ShapeCollectionDelegateBase（见 dbShapeCollection.h）
+//     → 因此它有 tl::UniqueId 提供的唯一标识 m_data_id，
+//       用于判断“两个 Region 是否共享同一实现”（写时复制的依据）。
+//   ★ 关键点：`clone ()` 是纯虚 —— 每个实现必须能克隆自己，
+//     这正是“修改操作返回新对象”得以实现的基础
+//     （门面在需要独占时才 clone 一份再改，避免影响共享者）。
+//
+// 【★ 为什么规模如此大（几百行纯虚函数）】
+//   因为 Region 的能力面很宽：布尔运算、sizing、选择/过滤、面积周长、
+//   与其它集合的互转（转边/转 EdgePairs）、遍历、字符串化……
+//   把它们抽象成接口后，**每个实现只需专注自己擅长的部分**：
+//     · FlatRegion：什么都能算，但数据是展开的（内存大）；
+//     · DeepRegion：只实现能在层次形式下做的事（内存小），
+//       遇到必须展开的操作就报错或先展开。
+//   ★ 实用提示：因此“某个操作在 Deep 下失败”往往不是 bug，
+//     而是**该实现不支持该操作**（需要先平铺）。
+// [[ZH-END]]
 class DB_PUBLIC RegionDelegate
   : public db::ShapeCollectionDelegateBase
 {
