@@ -207,6 +207,32 @@ private:
  *  a text size and a font id. Text size and font id are provided to be
  *  be able to render the text correctly.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **文本图形** —— 版图里的标注/标号（不是几何，是“贴在图上的字”）。
+//
+// 【它包含什么】如上英文注释：位置点 + 文本内容 + 文本变换 + 
+//   字号(text size) + 字体 id(font id)。
+//   ★ 关键认知：文本**不是几何图形** —— 它没有轮廓、不参与布尔运算、
+//     不计入面积。字号与字体只是给**渲染器**用的提示，不是几何尺寸。
+//     因此“文本的 bbox”是一个由字体度量决定的估计值（用于显示/选中），
+//     而非精确几何。
+//
+// 【★ 本文件的另一部分：字符串去重机制（容易被忽略）】
+//   本文件除了 text，还包含 StringRef / StringRepository：
+//     · 版图中文本字串会大量重复（如几万个相同的“VDD”），
+//       每个 text 都存一份字串会浪费大量内存。
+//     · 因此用**字符串仓库**统一管理：text 只持有 StringRef（引用），
+//       内容存在 StringRepository 里。
+//     · StringRef **可被转移**：它在仓库登记自己，仓库被销毁或字串被改时
+//       会通知（见 m_string_refs / unregister_ref）—— 这是为了
+//       “仓库变了，引用不能悬空”而设计的。
+//   ★ 实用影响：因此 text 的**拷贝很便宜**（只拷引用），
+//     但它的内容**不属于它自己** —— 修改仓库会影响所有引用者。
+//
+// 【与其它几何类型的关系】
+//   text 是 Shape 可以表示的四种形态之一：box / polygon / path / **text**。
+//   因此在遍历版图图形时，遇到“不是几何”的图形就是文本（见 dbShape.h）。
+// [[ZH-END]]
 
 template <class C>
 class DB_PUBLIC text

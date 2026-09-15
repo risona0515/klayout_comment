@@ -49,6 +49,31 @@ namespace db {
  *  The edge pair carries a flag which allows indicating symmetric mode: in this mode, the first and second edge are commutable.
  *  As a consequence, when the symmetric flag is used, edge_pair(e1, e2, true) == edge_pair(e2, e1, true).
  */
+// [[ZH-BEGIN]]
+// 功能：★ **边对 (edge pair)** —— 两条边的组合，专门用来**标记 DRC 违规**。
+//
+// 【为什么需要“一对边”作为一个类型】
+//   DRC 的结果几乎总是“两条边之间的关系不满足规则”，例如：
+//     · 间距不足：一条边与另一条边太近 → 这对边就是违规证据；
+//     · 宽度不足：同一条边的两侧间距太小 → 也是“一对边”。
+//   而错误标记（marker）本身不是多边形（没有面积）——
+//   因此不能用 polygon 表示，专门引入 edge_pair。
+//   这使得“违规”可以被**精确复现**（能指出是哪两条边），而不只是一个区域。
+//
+// 【★ 有向 / 对称 两种模式（本类最需要注意的语义）】
+//   默认**有向 (directed)**：first 与 second 不可交换，
+//       表达“从 first 指向 second”的关系方向。
+//   可选的 **对称 (symmetric)** 标志：置位后 first 与 second 可交换，
+//       即 edge_pair(e1, e2, true) == edge_pair(e2, e1, true)。
+//   ★ 这个区别会直接影响 **相等比较与去重**：
+//     做 DRC 结果去重 / 存入 set 时，若不注意对称标志，
+//     同一条违规可能因为边的顺序不同而被当成两条。
+//
+// 【与其它类型的关系】
+//   edge_pair 是 db::EdgePairs 集合（见 dbEdgePairs.h）的元素类型，
+//   而 EdgePairs 与 Region/Edges 同属“委托(delegate)”体系（见 dbRegion.h）。
+//   在 DRC 规则里，间距/宽度检查的输出通常就是 EdgePairs。
+// [[ZH-END]]
 template <class C>
 class DB_PUBLIC_TEMPLATE edge_pair
 {

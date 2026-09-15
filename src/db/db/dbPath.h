@@ -47,6 +47,46 @@
 
 namespace db {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbPath.h —— 路径（path）：»折线 + 线宽»，是版图里的“连线/互连”图形
+// ============================================================================
+//
+// 【为什么需要 path（而不是直接用 polygon）】
+//   考虑一条走线（net / wire）：它本质上是一串拐点 + 一个宽度：
+//        点1 --宽度 W--> 点2 --> 点3 --> ...
+//   若存成 polygon，需要手工算出带斜接(miter)的轮廓 —— 顶点数成倍、
+//   且改宽度就得重算。存成 path 只需点列 + 一个宽度：
+//     · 存储紧凑（一个路径就是点列 + 一个整数宽度）
+//     · 改宽度/改拐点很容易
+//     · 需要轮廓时再调 polygon() 转换（惰性展开）
+//   ★ 这就是上面英文注释的意思：“A path consists of a sequence of line
+//     segments and a width. The path can be converted to a polygon.”
+//
+// 【与其它几何类型的关系】
+//     point / vector      基础
+//     edge                边界线段
+//     path     ★          折线 + 宽度（本文件）→ 可转 polygon
+//     polygon             面（可能带孔）
+//     text                文本（见 dbText.h）
+//   path 与 polygon 是“同一图形的两种表示”，互相可转：
+//      path → polygon ：展开出带宽度与端帽(end cap)的轮廓
+//      polygon → path ：信息不全（轮廓无法还原成折线），因此**不提供**自动反向
+//
+// 【★ 两个影响使用的关键属性】
+//     1) **线宽(width)**：以 DBU 为单位的整数，可为 0。
+//        宽 0 的路径在几何上退化成一条线（面积为零）——
+//        注意这与 box/edge 的“零面积”情形同理，仍需特别处理。
+//     2) **端帽与拐角样式**：路径两端如何封闭、拐点如何连接（斜接/圆角/平头），
+//        都由**转换参数**（非路径对象本身）决定。
+//        ★ 因此同一个 path 在不同参数下可得到不同的 polygon ——
+//          这使得“路径对象的相等”与“其多边形形态的相等”不是一回事。
+//
+// 【本文件的类型】
+//   path_point_iterator / path_contour_iterator   遍历点列/轮廓
+//   path<C>          ★ 正式路径对象（typedef 为 db::Path / db::DPath）
+//   path_ref<…>      引用 + 变换（不拥有数据，同 polygon_ref 的思路）
+// [[ZH-END]]
 template <class Coord> class generic_repository;
 class ArrayRepository;
 
@@ -206,6 +246,37 @@ private:
  *  and a width.
  *  The path can be converted to a polygon.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **路径对象** —— 一串首尾相接的线段 + 一个线宽。版图中的“连线/走线”就是它。
+//
+// 【内部结构】
+//     path<C>
+//       ├─ pointlist_type  点列（折线的拐点，决定走向）
+//       └─ width           线宽（整数，DBU 单位）
+//   ★ 注意 path **不存轮廓** —— 轮廓是“点列 + 宽度 + 拐角样式”**算出来的**。
+//     因此 path 比等价 polygon 紧凑得多（这正是它存在的理由）。
+//
+// 【为什么比 polygon 更好用（针对走线场景）】
+//   · 改线宽：只改一个数，无需重算所有顶点。
+//   · 改拐点：只改点列。
+//   · 存储：顶点数就是拐点数，没有因加宽而翻倍的顶点。
+//   代价：需要轮廓时必须做一次转换（path → polygon）。
+//
+// 【★ 转换时的关键认知】
+//   path → polygon 的结果**取决于转换参数**（端帽 end cap、拐角 join 样式等），
+//   因此：
+//     · 同一 path 可得到不同的 polygon；
+//     · “两个 path 相等” 不等于 “它们的多边形形态相等”。
+//   若你在做几何比较/去重，务必先统一转换参数再比。
+//
+// 【★ 与 EdgeProcessor 的关系】
+//   EdgeProcessor 不认识 path，它只认边。因此在把路径送入布尔运算前，
+//   必须先展开成 polygon（再由 ShapeProcessor 拆成边）。
+//   见 dbShapeProcessor.h 中 ShapeProcessor::insert 对 path 的处理。
+//
+// 【线宽为 0 的情形】几何上退化成一条无宽度的线（面积为零）——
+//   与 box/edge 的“零面积”情形同理，需调用方特别处理（如仍要参与相交判断）。
+// [[ZH-END]]
 
 //  NOTE: we do explicit instantiation, so the exposure is declared
 //  as DB_PUBLIC - as if it wasn't a template
