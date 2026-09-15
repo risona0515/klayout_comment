@@ -35,6 +35,36 @@
 
 namespace db {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbVector.h —— 二维向量（位移量）
+// ============================================================================
+//
+// 【与 point 的关系 —— 使用本类前必须先搞清的事】
+//   db::vector 与 db::point 的**数据成员完全相同**（都是两个坐标），
+//   代码也几乎一样，但**语义截然不同**，库中刻意分成两个类：
+//
+//     db::point  = 位置（一个坐标点）
+//     db::vector = 位移（两点之差，或“方向 + 长度”）
+//
+//   上面英文注释正是这个意思：q = p + v，v 是相对位移而非绝对位置。
+//
+//   ★ 为什么分成两个类（而不是共用一个）：
+//     让**类型系统**阻止几何上无意义的运算。例如“两个位置相加”没有意义，
+//     而 point + point 没有重载，编译器会直接报错。合法组合（均有重载）：
+//         point  + vector → point      点沿位移移动
+//         point  - point  → vector     两点之差（得到位移）
+//         point  - vector → point
+//         vector ± vector → vector     位移叠加
+//
+// 【单位】与 point 相同 —— 整数版以 DBU 为单位，所以 vector(1000, 0) = 向右 1 微米。
+//
+// 【长度语义】与 dbEdge 一致的多套长度，勿混用：
+//     length()                 欧氏长度（已舍入回 distance_type）
+//     double_length()          欧氏长度（保留 double）
+//     sq_length()              欧氏长度平方（精确、无开方）← 比较长度的首选
+//     sq_double_length()       欧氏长度平方（double 版，避免整数溢出时用）
+// [[ZH-END]]
 template <class C> class point;
 
 /**
@@ -97,6 +127,12 @@ public:
    *
    *  HINT: this is a hack. It does not really make sense
    */
+  // [[ZH]] 功能：把**点**当作从原点出发的位移向量（显式转换，不隐式）。
+  // [[ZH]] 为何标 explicit：几何上“位置”与“位移”不应随便互转 ——
+  // [[ZH]] 显式书写可避免把坐标误当位移使用（那类 bug 很难发现）。
+  // [[ZH]] 对应关系：vector(p) == p - (0,0)。
+  // [[ZH]] 上游自己标注为 "HINT: this is a hack"（见上面英文注释）—— 属历史遗留，
+  // [[ZH]] 因此本构造函数宜少用，优先用 vector(p1, p2) 显式表达位移来源。
   explicit vector (const point_type &p)
     : m_x (p.x ()), m_y (p.y ())
   {
@@ -109,6 +145,10 @@ public:
    *  @param p1 The point to take as starting point
    *  @param p2 The point to take as end point
    */
+  // [[ZH]] 功能：由两个点构造位移 —— 即 p2 - p1（“从 p1 指向 p2”）。
+  // [[ZH]] ★ 这是库中最常用的向量来源（如边的方向向量 d() = p2 - p1）。
+  // [[ZH]] 坑：注意方向 —— 是 **p2 - p1**，不是 p1 - p2。参数顺序弄反会得到反向向量，
+  // [[ZH]]     进而使法线/左右侧判断全部反过来。
   vector (const point_type &p1, const point_type &p2)
     : m_x (p2.x () - p1.x ()), m_y (p2.y () - p1.y ())
   {
@@ -396,6 +436,8 @@ public:
   /**
    *  @brief The euclidian length 
    */
+  // [[ZH]] 功能：欧氏长度（向量模），已舍入回 distance_type。
+  // [[ZH]] 坑：舍入意味着不能靠它做精确比较；要比较长度请用 sq_length()。
   distance_type length () const
   {
     double ddx (x ());
@@ -406,6 +448,7 @@ public:
   /**
    *  @brief The euclidian length of the vector
    */
+  // [[ZH]] 功能：欧氏长度，保留 double 精度（不做舍入）。
   double double_length () const
   {
     double ddx (x ());
@@ -416,6 +459,8 @@ public:
   /**
    *  @brief The square euclidian length of the vector
    */
+  // [[ZH]] 功能：长度的**平方**（精确、无开方、无舍入）。
+  // [[ZH]] ★ 比较长度时应优先用它：平方保序（长度非负），且全整数运算无误差。
   area_type sq_length () const
   {
     return coord_traits::sq_length (0, 0, x (), y ());
@@ -450,6 +495,8 @@ public:
   }
 
 private:
+  // [[ZH]] 与 point 一样只有两个坐标，没有额外状态。参见 dbPoint.h 中对成员与“纯值类型”的说明。
+  // [[ZH]] 注意：这里的坐标含义是“位移分量”，不是“位置”。
   C m_x, m_y;
 };
 

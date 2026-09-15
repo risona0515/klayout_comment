@@ -413,9 +413,10 @@ def first_difference(got, want):
         g = got[i] if i < len(got) else "<missing>"
         w = want[i] if i < len(want) else "<missing>"
         if g != w:
-            # The single most common mistake is an unmarked blank line slipped
-            # in around a marker block.  Detect it and say so plainly.
-            # 最常见的错误是在标记块附近混入了未标记的空行。这里直接点明。
+            # The most common mistakes all amount to "a line was added or
+            # changed that does not carry a marker".  Name the likely ones.
+            # 最常见的错误都属于同一类：「新增或改动了不带标记的行」。
+            # 下面直接点出最可能的几种。
             hint = ""
             if not g.strip() or not w.strip():
                 hint = (
@@ -428,6 +429,26 @@ def first_difference(got, want):
                     "[[ZH-BEGIN]]/[[ZH-END]] 块之外留空行，"
                     "尤其不要紧跟在 [[ZH-END]] 之后加空行；"
                     "应复用已有的空行，或把空行放进块内。")
+            elif w.strip().startswith(("/**", "*", "*/")) or \
+                    g.strip().startswith(("/**", "*", "*/")):
+                hint = (
+                    "\n      HINT: this looks like an added or edited doc "
+                    "comment block. EVERY added line must be marked: turn the "
+                    "new block into '// [[ZH-BEGIN]] ... // [[ZH-END]]' lines, "
+                    "and never rewrite an existing '/** ... */' block -- add "
+                    "beside it instead."
+                    "\n      提示：这看起来是新增或改写了文档注释块。"
+                    "新增的每一行都必须带标记：把新块写成 "
+                    "'// [[ZH-BEGIN]] ... // [[ZH-END]]' 形式；"
+                    "而原有的 '/** ... */' 块绝不可改写，只能在旁边新增。")
+            elif g.strip().endswith(";") or w.strip().endswith(";"):
+                hint = (
+                    "\n      HINT: this looks like a code line was swallowed "
+                    "into a comment or merged with an adjacent line -- commonly "
+                    "caused by a literal backslash-n typed into the annotation "
+                    "text instead of a real line break."
+                    "\n      提示：这看起来是一行代码被吞进注释、或与相邻行合并了 ——"
+                    "常见原因是注释文本里写了字面的 \\n 而不是真正的换行。")
             return ("first mismatch at stripped line %d:\n"
                     "      got : %r\n"
                     "      want: %r%s" % (i + 1, g, w, hint))
