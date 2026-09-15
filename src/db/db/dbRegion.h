@@ -60,6 +60,67 @@ typedef addressable_shape_delivery<db::Polygon> AddressablePolygonDelivery;
  *
  *  Polygons inside the region may contain holes if the region is merged.
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  db::Region —— ★★ “区域”（一组多边形的集合）—— 库中最高频的几何抽象
+// ============================================================================
+//
+// 【一句话定位】
+//   Region 就是“**一个图层上的一片图形**”的抽象。上面英文注释说得很准：
+//       “A region basically is a set of polygons.”
+//   它把“一堆多边形”当作一个整体，于是你可以直接对它做集合运算：
+//       布尔（& | - ^）、尺寸缩放 (size)、合并 (merge)、选择/过滤 (filtered)、
+//       与其它区域求交/包含判断、面积/周长统计 ...
+//   ★ 这是 DRC / LVS / 版图工具里最常用的入口。
+//     新手应先掌握 Region，而不是直接去摆弄 Shape/Edge。
+//
+// 【★★ 委托架构（本文件与 dbShapeCollection.h 的关系）】
+//   Region 是**门面** —— 它自己不存多边形，只持有一个**委托**：
+//       db::Region                ← 门面（你用的对象，很小，可廉价拷贝）
+//          └─ RegionDelegate      ← 抽象接口（dbRegionDelegate.h）
+//                 ├─ db::FlatRegion      平铺：把数据摊平成一个大集合
+//                 ├─ db::DeepRegion      层次化：保留 cell 层次，不展开
+//                 ├─ db::EmptyRegion     空：还没有数据（惰性）
+//                 ├─ db::MutableRegion   可修改包装
+//                 ├─ db::AsIfFlatRegion  “假装平铺”（按需展开，但对外表现得像平铺）
+//                 └─ db::OriginalLayerRegion  直接指向版图某一层
+//   ★ 关键理解：**Region 的行为不取决于它的类，而取决于它背后的委托是哪个**。
+//     所以同一个 region.area() 调用，在 Flat 与 Deep 下实现完全不同，
+//     但**结果语义相同**（这是设计的关键契约）。
+//   为什么要这样：
+//     · 版图有层次结构。有些操作（如面积）在**层次形式下就能算**，无需展开 ——
+//       对上百亿图形的版图，展开是不可能的。
+//     · 而有些操作（如任意布尔）必须先展开。
+//     委托架构让库**按操作选择最省的实现**，而调用方无需关心。
+//     详见 dbDeepShapeStore.h 与 dbHierProcessor.h。
+//
+// 【★★ “merged / non-merged” 状态 —— 本类最重要的概念（上面英文注释的重点)】
+//   Region 有两种状态：
+//     · **merged（已合并）**：
+//         - 内部多边形**互不重叠**；
+//         - 相邻/相接的多边形已合并；
+//         - 多边形自相交已消除；
+//         - 多边形可以**带孔**；
+//         - ★ 任意点的环绕数 (wrap count) 只能是 **0 或 1**。
+//     · **non-merged（未合并）**：
+//         - 多边形可以互相重叠；
+//         - 允许多边形自相交；
+//         - ★ 环绕数可以是**任意值**。
+//   ★ 实用影响（必看）：
+//     1) 很多运算（面积、部分布尔、per-polygon 的选择）在两种状态下结果**不同**：
+//        未合并时重叠区域会被**重复计算**。
+//        所以若你需要“真实的几何覆盖”，应先 merge ()。
+//     2) 带孔与否**取决于是否 merged** —— 未合并时不会有孔的概念。
+//     3) 判断/改变状态：用 is_merged () 查询，用 merge () / merged () 变成合并态。
+//     4) 布尔运算的结果通常是 merged 的；直接构造/插入的多边形则不是。
+//
+// 【继承】public db::ShapeCollection —— 因此 Region 是一种“图形集合”，
+//   与 db::Shapes / db::Edges 等共享同一套集合接口（见 dbShapeCollection.h）。
+//
+// 【推荐使用顺序（面向新手）】
+//   构造/取层 → 处理 → merge () 成规范状态 → 做布尔/尺寸 → 读面积或转回图形。
+//   ★ 先 merge 再运算，可以避免“重叠被重复计算”这类隐蔽错误。
+// [[ZH-END]]
 class DB_PUBLIC Region
   : public db::ShapeCollection
 {
