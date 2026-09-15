@@ -53,27 +53,48 @@ namespace db
 // wrap count 与 property 两个核心概念）。本文件的注释侧重"实现细节与数据结构"。
 //
 // 【本文件的组织顺序】
-//   §1 工具与比较器        本行以下 ~ 550 行
+//   ⚠ 注意：本文件的注释**并非均匀覆盖**。下面的标注说明了每个区域的注释情况，
+//     避免误以为"列出来的都已注释"。标记含义：
+//       [已注] = 函数/结构级说明完整
+//       [部分] = 只有类头或关键片段有注释
+//       [待补] = 目前尚无函数级注释（仅靠 .h 里的声明级文档支撑）
+//
+//   §1 工具与比较器                                        [已注]
 //        NonZeroInsideFunc / ProjectionCompare / PolyMapCompare(已废弃)
 //        is_point_on_exact / is_point_on_fuzzy     精确 vs 模糊的"点在边上"
 //        safe_intersect_point                      顺序无关的求交（重要）
 //        CutPoints / WorkEdge                      阶段 1-3 的核心数据结构
 //        EdgePropCompare / EdgeXAtYCompare2        scanline 排序所需的比较器
-//   §2 交点计算            ~1080-1590
+//   §2 交点计算                                            [已注]
 //        add_hparallel_cutpoints                   共线水平边之间的切点
 //        get_intersections_per_band_90             正交（曼哈顿）快速路径
+//        edge_xaty_double / edge_xmin|xmax_at_yinterval_double
+//                                                  放宽带 [y-0.5, y+0.5] 的界计算
 //        get_intersections_per_band_any            任意角度通用路径
-//   §3 扫描线状态          ~1600-2160
-//        EdgeProcessorState                        单 (sink,evaluator) 的扫描线状态机
-//        EdgeProcessorStates + SkipInfo            单/多路统一 + skip 优化
-//   §4 主驱动板            redo_or_process
+//   §3 扫描线状态                                          [部分]
+//        EdgeProcessorState                        类头有说明，**各方法体待补**
+//        EdgeProcessorStates + SkipInfo            类头有说明，**各方法体待补**
+//   §4 主驱动板 redo_or_process                            [已注]
 //        阶段 1 prep → 阶段 2 intersections → 阶段 3 split → 阶段 4 production
-//   §5 公开 API 实现       insert / process / redo / simple_merge / merge / size / boolean
+//   §5 公开 API 实现                                       [部分]
+//        insert / clear / reserve / count          已注
+//        process / redo / redo_or_process          已注（转发与主驱动）
+//        评估器实现体（EdgePolygonOp / InteractionDetector /
+//        MergeOp / BooleanOp / BooleanOp2）        **待补**
+//        simple_merge / merge / size / boolean      **待补**（语义见 .h，实现体未注）
+//
+// 【为什么 §3 与 §5 的部分还有缺口】
+//   这不是刻意省略，而是当前进度的真实状态：已优先完成"数据结构 + 主驱动 + 求交数学"
+//   这三块最难读懂也最关键的部分，以及 .h 的全部声明级文档。
+//   剩余的评估器实现体与状态机方法体语义相对直白（多为转发或计数维护），
+//   其**契约**已在 .h 与对应类头中写清，但缺少逐函数说明。
 //
 // 【两个贯穿全文件的优化思想，读代码时留意】
 //   ① **正交快速路径**：版图绝大多数图形是曼哈顿的（边水平或垂直）。
 //      两条正交边求交只需 max/min，无需叉积与除法，因而单独写了 *_90 版本。
 //      判断入口会先看"是否全是正交边"，是则走快速路径。
+//      注意：只有一般（斜边）路径才需要 safe_intersect_point 包装，
+//      _90 路径可直接用 intersect_point —— 因为正交求交的公式天然对称。
 //   ② **一致性优先于绝对精度**：多处刻意使用 `volatile double` 阻止编译器
 //      把浮点值缓存在寄存器里重结合（见文件内相关注释）——
 //      目的不是数值精度，而是**保证同一位置两次计算得到逐位相同的 double**，
@@ -1453,22 +1474,88 @@ EdgeProcessor::clear ()
   mp_cpvector->clear ();
 }
 
+// [[ZH-BEGIN]]
+// 功能：处理**两条共线的水平边** —— 把 e2 的两个端点作为切点登记到 e1 上。
+//
+// 参数：e1 接收切点的边（将被切分的那条）；
+//       e2 提供端点的邻居边（**必须与 e1 同 y**，调用方已检查）；
+//       cell 当前 x/y 单元格 —— 只有落在格内的点才登记；
+//       cutpoints 全局切点表。
+//
+// 为什么需要它：两条水平边共线时，它们的"相交"不是一个点，而是**一段重叠区间**。
+//   无法用普通交点表示，因此改用一个约定：把 e2 的端点打进 e1，
+//   使 e1 在那些位置被切开，从而重叠区间的边界变得明确。
+//
+// ★ 两个关键细节：
+//   1) 判定用的是**严格内部**（`> e1_xmin && < e1_xmax`）—— 端点重合的情况不算，
+//      因为那种情形由调用方的 "端点是否相同" 检查另行排除，避免产生零长碎片。
+//   2) 登记时 `strong = false` → 写入的是**弱切点(attractor)**，不是强切点。
+//      这是刻意的：仅有一对平行水平边并不足以证明必须切分 ——
+//      是否真的切，取决于别处是否出现强切点（届时会通过 CutPoints::add 的
+//      提升机制把这里的弱切点一并提升）。见 CutPoints 的说明。
+// [[ZH-END]]
 static void
 add_hparallel_cutpoints (WorkEdge &e1, WorkEdge &e2, const db::Box &cell, std::vector <CutPoints> &cutpoints)
 {
   db::Coord e1_xmin = std::min (e1.x1 (), e1.x2 ());
   db::Coord e1_xmax = std::max (e1.x1 (), e1.x2 ());
+  // [[ZH]] e2 的左端点落在 e1 **内部**（严格不等，排端点）且在格内 → 登记为弱切点。
   if (e2.x1 () > e1_xmin && e2.x1 () < e1_xmax && cell.contains (e2.p1 ())) {
     e1.make_cutpoints (cutpoints)->add (e2.p1 (), &cutpoints, false);
   }
+  // [[ZH]] 右端点同理。
   if (e2.x2 () > e1_xmin && e2.x2 () < e1_xmax && cell.contains (e2.p2 ())) {
     e1.make_cutpoints (cutpoints)->add (e2.p2 (), &cutpoints, false);
   }
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  get_intersections_per_band_90 —— 阶段 2 的**正交快速路径**
+// ============================================================================
+//
+// 功能：在一个 y 带 [y, yy] 内，找出 [current, future) 这批边之间的所有交点，
+//       并把它们作为切点登记进 cutpoints。
+//
+// 适用前提（由调用方判断，本函数不再检查）：★ 本带内的边**全部是正交的**
+//       （即每条边要么水平要么垂直，没有斜边）。
+//       版图绝大多数图形满足此条件，因此这是最常走的路径。
+//
+// 参数：cutpoints 全局切点表（输出，会被追加）；
+//       current / future 本带边的区间（半开区间 [current, future)）；
+//       y / yy  本带的 y 范围；
+//       with_h  ★ 是否也要给**水平边**登记切点。
+//               为 false 时水平边只作为"切别人的刀"，自己不被切 ——
+//               因为阶段 3 默认会把水平边丢弃（除非评估器要逐边处理），
+//               切它纯属浪费。对应 EdgeProcessor 的 selects_edges()。
+//
+// 返回：无（结果通过 cutpoints 输出）。
+//
+// 【算法结构：三层嵌套的"扫描 + 分格"】
+//   ① 先按 xmin 排序，使边可以沿 x 方向有序推进。
+//   ② 外层扫 x：维护一个**活跃边集合**，把 xmin ≤ 当前 x 的边纳入；
+//      每轮取一个 x 区间 [x, xx)，形成一个矩形单元格 cell = (x, y, xx, yy)。
+//      xx 的选取沿用 fill_factor 启发式（与 redo_or_process 里 y 分带同思路）。
+//   ③ 在 cell 内做两两配对，只处理**落在同一格内**的边对 —— 这是空间剪枝，
+//      避免 O(n²) 的全量两两比较。
+//   ④ 每轮结束把 xmax < x 的边从活跃集合中移除（就地压实，见函数末尾）。
+//
+// ★★ 一个非常重要的细节：本函数用裸的 `intersect_point`，
+//    而不是 safe_intersect_point。这是**安全**的，因为两条正交边求交时，
+//    db::edge::intersect_point 走的是 "两个包围盒取交集" 的分支：
+//        x = max(min(p1x,p2x), min(e1x,e2x))
+//        y = max(min(p1y,p2y), min(e1y,e2y))
+//    该表达式关于两条边**完全对称**，交换实参不会改变结果。
+//    而一般（斜边）路径就不对称了，因此 _any 版本必须用 safe_intersect_point。
+//    这解释了为什么两个版本的求交调用方式不同 —— 不是笔误。
+//
+// 坑：本函数**不检查**边是否真的正交；若本带混入斜边，结果将不正确。
+//     判定由调用方（redo_or_process 中的 is90 标志）负责。
+// [[ZH-END]]
 static void
 get_intersections_per_band_90 (std::vector <CutPoints> &cutpoints, std::vector <WorkEdge>::iterator current, std::vector <WorkEdge>::iterator future, db::Coord y, db::Coord yy, bool with_h)
 {
+  // [[ZH]] ① 按 xmin 排序，使下面的活跃边集合可以沿 x 有序推进。
   std::sort (current, future, edge_xmin_compare<db::Coord> ());
 
 #ifdef DEBUG_EDGE_PROCESSOR
@@ -1624,13 +1711,34 @@ get_intersections_per_band_90 (std::vector <CutPoints> &cutpoints, std::vector <
  *  it is important that this method delivers exactly (!) the same x for the same edge 
  *  (after normalization to dy()>0) and same y!
  */
+// [[ZH-BEGIN]]
+// 功能：db::edge_xaty 的**double y** 版本 —— 求边在 y（可为小数）处的 x。
+//
+// ★ 何时需要它：_any 版本会把扫描带到**故意放宽 0.5 DBU**，
+//   即用 y-0.5 / y+0.5 这样的**分数** y 去求 x（见 get_intersections_per_band_any）。
+//   整数版的 edge_xaty 接不了小数 y，故另写此版。
+//
+// 参数：e 目标边（按值传递，内部会归一化方向）；
+//       y 扫描线 y（double，可为小数）。
+// 返回：double 的 x 值。
+//
+// 与 edge_xaty 完全相同的**可复现性契约**：
+//   同一 (边, y) 必须返回逐位相同的 double —— 否则排序不稳定。
+//   因此这里的插值表达式顺序同样不可重排。
+//
+// 注意：本函数**没有** edge_xaty2 那个"水平边取最小 x"的特殊处理。
+//   它只用于计算带的左右边界（那里水平边有单独的 if 分支处理），
+//   而非用于最终的扫描线排序。
+// [[ZH-END]]
 template <class C>
 inline double edge_xaty_double (db::edge<C> e, double y)
 {
+  // [[ZH]] 归一化为 p1.y <= p2.y，使同一条边只有一种参数化。
   if (e.p1 ().y () > e.p2 ().y ()) {
     e.swap_points ();
   }
 
+  // [[ZH]] 三段式：低于起点→夹到起点 x；高于终点→夹到终点 x；否则插值。
   if (y <= e.p1 ().y ()) {
     return e.p1 ().x ();
   } else if (y >= e.p2 ().y ()) {
@@ -1643,14 +1751,39 @@ inline double edge_xaty_double (db::edge<C> e, double y)
 /**
  *  @brief Computes the left bound of the edge geometry for a given band [y1..y2].
  */
+// [[ZH-BEGIN]]
+// 功能：求该边在 y 区间 [y1, y2] 内的**最左 x**（即 x 的下界），并向下取整。
+//
+// ★ 用途（为什么需要它）：_any 路径的扫描带被放宽到 [y-0.5, y+0.5]，
+//   因此一条斜边在带内可能跨越不同的 x。要判断"哪些边可能有交互"，
+//   必须用边在整个带内的 x 范围（而不是某一条扫描线上的瞬时 x）来做排序与剪枝。
+//   本函数提供这个范围的下界。
+//
+// 参数：e 目标边；y1 / y2 区间下/上界（double，带 0.5 偏移）。
+// 返回：C 型的 x 下界（已 floor，保证是**偏保守**的左界）。
+//
+// 实现：分三种情况，关键是斜边那一条 ——
+//   · dx == 0（垂直边）：x 恒定，直接返回 p1().x()。
+//   · dy == 0（水平边）：x 在两端之间，取 min。
+//   · 否则（斜边）：x 随 y 单调变化，因此最左 x 必然落在 y1 或 y2 **之一**。
+//     选哪个由 x 的增减方向决定：x 随 y 递增 ⟺ dx 与 dy **同号**。
+//     源码用 `((e.dy () < 0) ^ (e.dx () < 0)) == 0` 表达"同号"（异或为 0 即同号）：
+//         同号 → x 递增 → 最小值在区间**下端 y1**
+//         异号 → x 递减 → 最小值在区间**上端 y2**
+//     最后套 floor() 把 double 结果向下取整为整数坐标 ——
+//     向下取整是刻意的：使得到的左界**不会偏右**，宁可宽一点也不能漏掉可能的相交。
+// [[ZH-END]]
 template <class C>
 inline C edge_xmin_at_yinterval_double (const db::edge<C> &e, double y1, double y2) 
 {
+  // [[ZH]] 垂直边：x 恒定，与 y 无关。
   if (e.dx () == 0) {
     return e.p1 ().x ();
   } else if (e.dy () == 0) {
+    // [[ZH]] 水平边：x 在两端点之间，取下界。
     return std::min (e.p1 ().x (), e.p2 ().x ());
   } else {
+    // [[ZH]] 斜边：同号（异或==0）→ x 递增 → 取 y1；否则取 y2。再 floor 保守化。
     return C (floor (edge_xaty_double (e, ((e.dy () < 0) ^ (e.dx () < 0)) == 0 ? y1 : y2)));
   }
 }
@@ -1658,14 +1791,28 @@ inline C edge_xmin_at_yinterval_double (const db::edge<C> &e, double y1, double 
 /**
  *  @brief Computes the right bound of the edge geometry for a given band [y1..y2].
  */
+// [[ZH-BEGIN]]
+// 功能：求该边在 y 区间 [y1, y2] 内的**最右 x**（即 x 的上界），并向上取整。
+//
+// 参数与语义均与 edge_xmin_at_yinterval_double 对称（同为"偏保守"的界）。
+//
+// ★ 与 xmin 版的两处差异（容易看漏）：
+//   1) 选择区间的条件由 `== 0` 改为 `!= 0` —— 因为求最大值时方向判断正好相反：
+//        同号（x 递增）→ 最大值在区间**上端 y2**；异号 → 在**下端 y1**。
+//   2) 用 ceil() 而非 floor() —— 上界要向上取整，同样是为了保守
+//        （宁可宽一点，不能把可能相交的边排除掉）。
+// [[ZH-END]]
 template <class C>
 inline C edge_xmax_at_yinterval_double (const db::edge<C> &e, double y1, double y2) 
 {
+  // [[ZH]] 垂直边：x 恒定。
   if (e.dx () == 0) {
     return e.p1 ().x ();
   } else if (e.dy () == 0) {
+    // [[ZH]] 水平边：取上界。
     return std::max (e.p1 ().x (), e.p2 ().x ());
   } else {
+    // [[ZH]] 斜边：注意条件是 != 0（与 xmin 版相反），并用 ceil 保守化。
     return C (ceil (edge_xaty_double (e, ((e.dy () < 0) ^ (e.dx () < 0)) != 0 ? y1 : y2)));
   }
 }
@@ -1676,39 +1823,118 @@ inline C edge_xmax_at_yinterval_double (const db::edge<C> &e, double y1, double 
  *  This function is intended for use in scanline scenarios to determine what edges are 
  *  interacting in a certain y interval.
  */
+// [[ZH-BEGIN]]
+// 功能：_any 路径的排序比较器 —— 按"边在 y 区间 [y1,y2] 内的左界"给边排序。
+//
+// 参数：构造时传入区间 y1/y2（对应放宽后的 dy = y-0.5 与 dyy = yy+0.5）。
+// 返回：a 应排在 b 之前时为 true。
+//
+// 为什么不能直接用 xmin 排序：_any 的带被放宽了 0.5 DBU，斜边在带内 x 会变化，
+//   必须用"带内左界"而非"某点 x"来决定次序，否则相邻带之间边的相对次序会错乱。
+//
+// 结构：与 EdgeXAtYCompare2 同样的三段式 ——
+//   ① 包围盒快速排除（两种相对位置各一分支，免去求界计算）；
+//   ② 用带内左界比较；
+//   ③ 相等时用 `a < b` 兑底。
+//
+// ★ 兑底那一步（`return a < b;`）与其它比较器一样是**必需**的：
+//   没有它就不构成严格弱序，std::sort 对"相等"元素的相对次序未定义，
+//   结果不可复现。
+// [[ZH-END]]
 template <class C>
 struct edge_xmin_at_yinterval_double_compare
 {
+  // [[ZH]] 参数：y1/y2 限定比较所用的 y 区间（放宽后的带边界）。
   edge_xmin_at_yinterval_double_compare (double y1, double y2)
     : m_y1 (y1), m_y2 (y2)
   {
     // .. nothing yet ..
   }
 
+  // [[ZH]] 功能：按带内左界比较。见上方类注释。
   bool operator() (const db::edge<C> &a, const db::edge<C> &b) const
   {
     if (edge_xmax (a) < edge_xmin (b)) {
+      // [[ZH]] ① a 整体在 b 左侧（用普通包围盒即可判定）→ a 在前，免去求界。
       return true;
     } else if (edge_xmin (a) > edge_xmax (b)) {
+      // [[ZH]] ① a 整体在 b 右侧 → a 在后。
       return false;
     } else {
+      // [[ZH]] ② 区间重叠，必须算带内左界才能定序。
       C xa = edge_xmin_at_yinterval_double (a, m_y1, m_y2);
       C xb = edge_xmin_at_yinterval_double (b, m_y1, m_y2);
       if (xa != xb) {
         return xa < xb;
       } else {
+        // [[ZH]] ③ 左界相等：用边自身的全序兑底，保证严格弱序与结果可复现。
         return a < b;
       }
     }
   }
 
 public:
+  // [[ZH]] m_y1 / m_y2：比较所用的 y 区间（即放宽后的带边界 dy..dyy）。
   double m_y1, m_y2;
 };
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  get_intersections_per_band_any —— 阶段 2 的**通用（任意角度）路径**
+// ============================================================================
+//
+// 功能与调用方式和 get_intersections_per_band_90 完全对应
+//   （找出本带内边的所有交点、登记为切点），
+//   但处理的是**含斜边**的输入，因此无法用包围盒相交那种简单判据。
+//
+// 参数：含义同 _90 版（cutpoints / current / future / y / yy / with_h）。
+//
+// ★★ 本函数最关键的设计：把扫描带**故意放宽 ±0.5 DBU**
+//       double dy  = y  - 0.5;
+//       double dyy = yy + 0.5;
+//    为何要这么做（这是整个"模糊"机制的核心）：
+//      整数网格上，两条边可能在数学上“差半个单位就相交”。若按精确边界划分扫描带，
+//      这种“几乎相交”会被拆到两个不同的带里，于是两边各自都看不到对方，
+//      结果留下一个几乎重合却未打通的碎片。
+//      把带向外放宽 0.5 DBU，就可以把这种临界情形**拉进同一个带**一并处理；
+//      再用 is_point_on_fuzzy（±1 DBU 锥形邻域）做判定，把“几乎共线”当作共线。
+//    代价是要用带内左界（edge_xmin_at_yinterval_double）来排序，
+//      因为斜边在这个放宽后的带里 x 会变化。
+//
+// 【与 _90 版的四个具体差异】
+//   1) 排序与剪枝用 edge_xmin_at_yinterval_double_compare（带内左界），
+//      而非 _90 的 edge_xmin_compare。
+//   2) 求交一律走 **safe_intersect_point**，而非裸的 intersect_point。
+//      原因：斜边的求交公式**关于实参顺序不对称**，
+//      若不固定顺序，同一交点会得到两个不同坐标，破坏扫描线排序的稳定。
+//      详见 safe_intersect_point 的说明。（_90 版能省去这层包装，因为
+//      两条正交边的求交结果是 max/min 形式、天然对称。）
+//   3) 交点不能当场就当作切点，必须先收进 weak_points **暂存**，
+//      留到两两配对全部跑完后再统一插入 —— 因为一个交点往往同时落在多条边上，
+//      而它写入每条边时的强弱属性要一致。
+//   4) 多了 p1_weak（端点级弱交互）的**延迟决策**机制，见下。
+//
+// 【p1_weak 机制：为何端点也要延迟决策】
+//   若 c1 的端点 c1.p1 落在 c2 的模糊邻域内（但不精确在 c2 上），
+//   则这个端点可能需要在 c2 上产生一个切点。但是否真的需要，
+//   取决于它是否实际影响了**两条以上**的边（源码注释明确说了这一点）。
+//   于是先把 (c1, c2) 这种候选对缓存在 p1_weak，等到本格配对结束后：
+//     · 若任一目标边已经有强切点 → 把该端点作为**强切点**插入所有目标边；
+//     · 否则 → 用 add_attractor 登记为**弱切点**，
+//              并用对方 CutPoints 的下标把几条边**串成链**（变量 n 不断前推），
+//              这样将来只要其中一条被提升，链上的其它边也会被一并提升。
+//   这与 CutPoints 的 attractor 提升机制是同一套思路的两个层次。
+//
+// 【结构】与 _90 一致：排序 → 扫 x 分格 → 格内两两配对 → 移除失效边（压实）。
+//   唯一的额外差异在末尾：压实判据同时看 edge_xmax 与 edge_xmax_at_yinterval_double
+//   （因为"已被移出带"也可能由放宽后的右界决定）。
+//
+// 坑：本函数依赖调用方正确设置 y / yy（已放宽前的原值，函数内部自己算 ±0.5）。
+// [[ZH-END]]
 static void 
 get_intersections_per_band_any (std::vector <CutPoints> &cutpoints, std::vector <WorkEdge>::iterator current, std::vector <WorkEdge>::iterator future, db::Coord y, db::Coord yy, bool with_h)
 {
+  // [[ZH]] ★ 把带向外放宽 0.5 DBU —— 本函数全部逻辑的基础，见上方说明。
   double dy = y - 0.5;
   double dyy = yy + 0.5;
   std::vector <std::pair<const WorkEdge *, WorkEdge *> > p1_weak;   // holds weak interactions of edge endpoints with other edges
