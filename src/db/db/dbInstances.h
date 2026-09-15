@@ -59,6 +59,53 @@ typedef db::array <db::CellInst, db::DTrans> DCellInstArray;
  *  @brief A classification type for editable mode types and concepts
  */
 struct InstancesEditableTag { };
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbInstances.h —— db::Instance：单元层次结构里的“引用/实例”
+// ============================================================================
+//
+// 【它是什么（一句话）】
+//   一个 Instance 表示“本 cell 引用了另一个 cell”这件事，并携带
+//   **在哪里、怎么摆放**（位置/旋转/镜像，可能还带阵列）。
+//   它就是把多个 Cell 连成层次图（cell graph）的“边”。
+//
+// 【★★ 方向容易搞反：谁引用谁】
+//   Instance 属于**父 cell**（它存在父 cell 的实例列表里），
+//   但它指向**子 cell**。所以：
+//     · “我引用了哪些 cell” → 遍历我的 instance 列表
+//     · “谁引用了我”         → 看我的父实例列表（见 dbCell.h 的说明）
+//   遍历层次时两个方向都会用到：递归展开用前者，找调用者/唯一实例用后者。
+//
+// 【★ Instance 与 db::Shape 是同一套思路（句柄 + 抽象接口）】
+//   下面 class Instance 处的英文注释明确说了它“与 db::Shape 类似”。
+//   因此 dbShape.h 里那四条行为对 Instance **同样适用**：
+//     · 拷贝便宜（只拷句柄，不拷数据）；
+//     · 拷贝后指向**同一个**实例（不是快照）；
+//     · 底层实例被删除后**静默悬空**，访问后果未定义；
+//     · 可以为 null（“无效引用”）。
+//   实用结论：不要跨修改操作长期保存 Instance。
+//
+// 【为什么本文件大量内容与“阵列”相关】
+//   实例常常是**规则重复**的（例如存储阵列的单元）。
+//   因此一个“实例”背后可能是一个**阵列**（见 dbArray.h）：
+//   一份子 cell 引用 + 一套重复规则（步距、行列数）。
+//   ★ 重要影响：遍历一个 instance 可能产生**很多个**实际摆放位置，
+//     而不是一个。写代码时要想清楚“我是在遍历实例，还是在遍历摆放位置”。
+//
+// 【★ 上面那两个 editable_traits 特化在做什么（可编辑性 → 数据结构选择）】
+//   71 行附近的特化，按“实例集合能否被修改”给出不同的底层空间索引：
+//     · 可编辑 (InstancesEditableTag)     → box_tree
+//         支持增删，因此结构需要允许修改；
+//     · 不可编辑 (InstancesNonEditableTag) → unstable_box_tree
+//         “unstable” 意味着可以更省内存/更快，代价是不支持修改。
+//   ★ 这是全库常见的一类设计：**用类型（tag）表达能力，让编译期选最优实现**。
+//     与我们已看过的“变换类按能力分层”“Shapes 按类型分容器”是同一思路。
+//
+// 【本文件其它内容】
+//   CellInstArray / ...WithProperties 等 typedef   实例阵列类型
+//   instances_iterator 系迭代器                     层次遍历的基础
+//   Instance 及其带属性变体                          句柄与接口
+// [[ZH-END]]
 
 /**
  *  @brief A classification type for non-editable mode types and concepts
