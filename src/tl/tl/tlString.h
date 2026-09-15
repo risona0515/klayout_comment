@@ -75,6 +75,34 @@ template <class T> bool test_extractor_impl (tl::Extractor &, T &) { throw Extra
  *  and operator does reuse memory allocated so far. This way this object is
  *  better suited to string objects that frequently change.
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  本文件的三块内容（tl 的“字符串 + 文本转换”基础设施）
+// ============================================================================
+//
+//   1) **两个异常类**（见文件上方）
+//        ExtractorNotImplementedException  —— 某类型未实现“从文本解析”
+//        StringConversionException         —— 某类型未实现“转成文本”
+//      ★ 它们的意义：库用**模板 + 特化**做通用文本转换，
+//        若某类型没提供对应特化就抛这两个异常，而**不是编译报错** ——
+//        这是“运行期可扩展”的取舍（便于脚本/插件注册新类型）。
+//
+//   2) **默认的 extractor 模板**（见文件上方那两行）
+//      ★ 这两个默认实现是“**抛异常**”而不是空实现 ——
+//        这样“忘了为某类型实现解析”会在运行时明确报错，
+//        而不是静默读到垃圾值。
+//      这两个名字（extractor_impl / test_extractor_impl）正是我们在
+//      dbPoint.cc、dbEdge.cc、dbTrans.cc、dbText.cc 里反复为其写特化的那两个函数。
+//      → 本文件是那套机制的**总声明处**，那些 .cc 是**逐类型的实现**。
+//
+//   3) **tl::string 类**（本注释所在处，本文件主体）
+//      一个“为特定用途优化”的字符串类，与 std::string 的差别见下。
+//
+// 【★ 与 tl::Variant 的关系（见 tlVariant.h）】
+//   Variant 的字符串分支就是字符串；两者配合使“任意值 ↔ 文本”成为可能：
+//       值 --to_string--> 文本 --Extractor--> 值
+//   ★ 这条往返链是脚本绑定、属性序列化、配置文件读写的**共同基础**。
+// [[ZH-END]]
 
 class TL_PUBLIC string
 {
