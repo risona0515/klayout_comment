@@ -94,9 +94,62 @@ join_layer_names (std::string &s, const std::string &n);
 /**
  *  @brief The generic reader base class
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbReader.h —— 读入版图（回答“文件怎么变成 Layout”）
+// ============================================================================
+//
+// 【本文件的三层结构（由下到上理解）】
+//   1) **异常类**（文件开头）
+//        ReaderException              读取出错的基类异常
+//        ReaderUnknownFormatException ★ “无法识别格式”专用异常
+//      ★ 后者尤其值得注意：它让调用方能**区分“格式不认识”与“文件内容损坏”**。
+//        这在“按扩展名猜格式”或“遍历多种格式尝试读取”时是必需的。
+//
+//   2) **ReaderBase** —— 各格式 reader 的抽象基类（此注释所在处）
+//        规定“一个 reader 必须能做什么”（读入、报错、给进度…）。
+//        具体实现由各格式插件提供（见 dbStream.h 的 StreamFormatDeclaration）。
+//
+//   3) **Reader** —— ★ **面向使用者的统一入口**（本文件主体）
+//        你给它一个流/文件名，它自己去已注册的格式里挑一个能处理的。
+//        ★ 这意味着**你不必知道文件是什么格式** —— 由内容探测决定。
+//
+// 【★★ 使用 Reader 的典型流程与两个必知行为】
+//   典型：
+//       tl::InputStream s ("x.gds");   // 1. 先打开流
+//       db::Reader r (s);              // 2. 构造 → 探测格式（可能抛异常）
+//       db::Layout ly;                 // 3. 目标 Layout
+//       r.read (ly);                   // 4. 读入
+//
+//   ★ 行为一：**构造时就会探测格式，探测失败即抛异常**。
+//     上游英文注释原文：
+//       "If no valid format can be detected, the constructor will throw an exception.
+//        The stream must be opened already in order to allow format detection."
+//     → 所以：**流必须先打开**才能构造 Reader；
+//     → 并且应把构造放在 try/catch 里，或先用探测接口判断。
+//
+//   ★ 行为二：read() **只往 Layout 里“插入”对象**，不做额外处理。
+//     原文："This will not do much on the layout object beside inserting the objects."
+//     → 即：read 之后 Layout 只包含**读到的原始内容**；
+//     → 若需要“规范化”（乱序层、缺失 bbox 等），要自己再做。
+//     → 这也解释了为什么导入后常常还要再跑一次合并/清理。
+//
+// 【★ 选项（options）—— 读取不是“无参数”的操作】
+//   本文件还管理各格式的**读取选项**，例如：
+//     · 层映射（layer map）：把文件里的层对应到逻辑层；
+//     · 是否创建 PCell（而非展开成静态几何）等。
+//   选项通过 db::LoadLayoutOptions 一类的对象传入，并可按格式分别设置。
+//   ★ 实用影响：**同一个文件用不同选项读入，结果可以不同**。
+//     因此“读进来的东西不符合预期”时，先检查选项，而不是怀疑文件。
+//
+// 【与写出的对称性】
+//   写出见 dbWriter.h：结构完全对称（Writer 探测格式 → 写 Layout）。
+//   格式的注册见 dbStream.h。
+// [[ZH-END]]
 class DB_PUBLIC ReaderBase
 {
 public:
+  // [[ZH]] 功能：ReaderBase 构造 —— 各格式 reader 的基类实例化入口。
   ReaderBase ();
   virtual ~ReaderBase ();
 
