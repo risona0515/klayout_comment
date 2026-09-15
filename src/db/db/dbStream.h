@@ -48,6 +48,48 @@ namespace db
 class ReaderBase;
 class WriterBase;
 
+// [[ZH-BEGIN]]
+// 功能：★ **文件格式的注册声明** —— 这是整个 I/O 体系的“插件点”。
+//
+// 【★★ 本类的角色：库与具体格式之间的接口】
+//   本库支持 GDS2 / OASIS / DXF / CIF / LEF-DEF / MAG / Gerber ... 多种格式。
+//   但 db 核心**不应硬编码**任何一种 —— 否则加一个格式就要改核心。
+//   于是设计成本类：**每种格式提供一个 StreamFormatDeclaration 的派生类**，
+//   向库注册“我是谁、我怎么读、我怎么写”。
+//   ★ 具体格式的实现在插件目录里，例如：
+//       src/plugins/streamers/gds2/   → GDS2 的 reader/writer
+//       src/plugins/streamers/oasis/  → OASIS 的 reader/writer
+//       src/plugins/streamers/lefdef/ → LEF/DEF
+//   而 db::Reader / db::Writer（见 dbReader.h / dbWriter.h）则是**面向使用者的
+//   统一入口**：你给文件名，它们去已注册的格式里挑一个能处理的。
+//
+// 【★★ 六个纯虚函数 = 一个格式必须回答的六个问题】
+//   format_name ()       —— 格式的短名（如 "GDS2"），用于按名指定格式。
+//   format_desc ()       —— 可读描述，用于界面/错误信息。
+//   create_reader ()     —— 造一个能读该格式的 reader，**不支持则返回 0**。
+//   can_read ()          —— 是否支持读（有些格式只写不读）。
+//   create_writer ()     —— 造一个 writer；**不支持则返回 0**。
+//   can_write ()         —— 是否支持写。
+//   supports_context ()  —— ★ 是否能携带“上下文”（PCell 参数、库引用等）。
+//                          含义见下。
+//   reader_options_xml_element () —— 提供“读取选项”在技术 XML 里的表示。
+//
+// 【★ supports_context 是什么意思（容易被忽略但很重要）】
+//   有些格式（如 OASIS、原生 XML）不止存几何，还能存**单元的参数化信息**
+//   （PCell 参数）与**跨库引用**。这类“超出几何本身的信息”就是 context。
+//   ★ 实用影响：
+//     · 若格式不支持 context，则 PCell 会被**展开成静态几何**（参数信息丢失）；
+//     · 因此“存成哪种格式”会影响**能否保留参数化单元**。
+//     这是 GDS2 与 OASIS 的一个重要差别来源。
+//
+// 【★ 由于全是纯虚函数，本类必须被继承】
+//   你**不能直接实例化** StreamFormatDeclaration —— 它只是一份契约。
+//   加新格式的步骤就是：写一个派生类实现这六个函数，然后注册它。
+//
+// 【本文件其余内容】
+//   ReaderOptionsXMLElement / 相关辅助 —— 把各格式的读取选项接入技术的 XML 持久化
+//   db::ReaderBase / WriterBase            —— reader/writer 的具体基类（在其它头文件）
+// [[ZH-END]]
 /**
  *  @brief A stream format declaration
  */
