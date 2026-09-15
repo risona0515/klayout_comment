@@ -51,6 +51,43 @@ class TechnologyComponent;
  *  present in any case. If a technology with an unknown name is requested,
  *  this default technology is returned.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **技术（technology）** 的容器 —— 这是本文件第一个需要理解的概念。
+//
+// 【什么是“技术”（technology）】
+//   在版图领域，“技术”指**工艺相关的整套设置**，例如：
+//     · 层堆叠（layer stack）：各层的物理厚度、顺序；
+//     · 各层的默认显示属性（颜色、填充图案）—— 即 layer properties 模板；
+//     · 该工艺专用的 DRC / LVS 规则脚本（decks）；
+//     · 变量（technology variables）如最小线宽等。
+//   ★ 类比：technology 之于版图文件，类似于“工程配置/环境”之于代码 ——
+//     它不改变几何，但决定了**如何解读与检查**这些几何。
+//
+// 【★★ 三条必须知道的语义（上面英文注释都点到了）】
+//   1) **容器按名字关联技术**，并提供迭代器遍历所有技术。
+//   2) **总是至少有一个技术 —— 默认技术 (default)**：
+//      “The container features at least one technology (the default) which is
+//       present in any case.”
+//      ★ 即：你不需要先创建就能用；默认技术永远存在。
+//   3) **★ 按未知名字查询 → 返回默认技术（而不报错、不返回空）**：
+//      “If a technology with an unknown name is requested, this default
+//       technology is returned.”
+//      ★ 这是一个容易被忽略的行为：
+//        · 好处：调用方不必到处处理“找不到”的情况，代码更简洁；
+//        · 风险：**拼错技术名不会报错**，你会静默地拿到默认技术，
+//          表现为“我的工艺设置没生效”。
+//      写工具时若需要区分“真的有这个技术吗”，必须另行判断（如列表是否包含该名）。
+//
+// 【继承 tl::Object 的意义】
+//   Technologies 参与共享/弱指针的引用计数管理（见 tlObject.h）：
+//   技术容器会被多处引用（各视图、脚本），需要“使用中不被销毁”的保证。
+//
+// 【本文件其余内容】
+//   Technology                    —— 单个技术的完整定义（本文件主体）
+//   TechnologyComponent           —— 技术的一个“组件”（如某个 DRC deck）
+//   TechnologyComponentProvider   —— 组件提供者的基类（按需给出组件内容）
+//   XML 序列化辅助类             —— 技术的读写（保证配置可持久化）
+// [[ZH-END]]
 class DB_PUBLIC Technologies
   : public tl::Object
 {
@@ -263,6 +300,41 @@ private:
  *  This class represents one technology.
  *  A technology has a name and a description.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **单个技术** —— 一整套工艺相关设置的载体（见文件头对“技术”的解释）。
+//
+// 【它包含什么（本类是“设置的总和”）】
+//   名字与描述、层堆叠、各层属性模板、DRC/LVS 规则脚本（decks）、
+//   变量（variables），以及**插件注册的组件**（见下面的 TechnologyComponent）。
+//
+// 【★★ 本类最重要的扩展机制：组件 (TechnologyComponent)】
+//   上面英文注释说明了它的用途：
+//     “Plugins may register technology components in every technology and use
+//      those components to store their specific data.”
+//   即：技术的**核心字段是库自身定义的**，但**插件可以往里塞自己的数据**，
+//   而且这些数据会**跟着技术一起被持久化**（见本文件末尾的 XML 序列化类）。
+//   ★ 这是一个很值得学习的可扩展性设计：
+//     · 库不需要知道插件要存什么；
+//     · 插件通过一句注册即可让自己的配置成为“技术的一部分”；
+//     · 组件的名字用于在技术内标识自己（因此要唯一/稳定）。
+//   ★ 与 db::Library 的对比：Library 用**继承**来扩展（子类实现“怎么给 Layout”），
+//     Technology 用**组合 + 注册**来扩展（不改类，往里加组件）。
+//     两种扩展方式是本库的两种基本手法。
+//
+// 【★ 事件机制（与 GUI 联动的方式）】
+//   本类（以及容器 Technologies）会发出事件，例如：
+//     · 技术被增删 → 触发 technologies_changed_event；
+//     · 某个技术被修改 → 触发 technology_changed_event（并把该技术作为参数）。
+//   ★ 为什么需要：技术设置会同时影响很多视图/工具（层显示、DRC 面板...），
+//     它们都订阅这些事件以自动刷新。
+//     因此**修改技术时不需要手工通知各处** —— 事件会传播（见下面
+//     Technologies::technology_changed 的“转发”逻辑）。
+//
+// 【与其它类型的关系】
+//   Technologies         ← 容器（按名字查找、遍历、发事件）
+//   Technology           ← 本类：单个技术的全部设置
+//   TechnologyComponent  ← 插件可注册的附加数据
+// [[ZH-END]]
 class DB_PUBLIC Technology
   : public tl::Object
 {
