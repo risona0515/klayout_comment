@@ -39,9 +39,55 @@ namespace tl {
 namespace db
 {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbMatrix.h —— 矩阵（2D/3D），用作几何变换的底层表示
+// ============================================================================
+//
+// 【与 dbTrans.h 的关系（先弄清这个，否则会疑惑“为什么有两套变换”）】
+//   本文件是**底层线性代数表示**；dbTrans.h 是**面向几何语义的封装**。
+//     db::matrix_2d / matrix_3d   ← 裸矩阵（本文件）：纯数学，无几何语义
+//            ↑ 用于实现
+//     db::simple_trans / complex_trans 等（dbTrans.h）：带旋转/镜像/位移语义
+//
+//   为什么两者并存：
+//     · 变换类需要回答“是否镜像/旋转多少度”这类**语义问题**；
+//       矩阵只能回答“这两个数是多少”，因此矩阵无法完整表达旋转语义。
+//     · 反过来，拼接两个矩阵只是一次乘法，比维护语义字段更直接。
+//   所以库的“任意旋转”最终是靠矩阵算的，但对外暴露的是变换对象。
+//
+// 【★ 一个非常容易踩的坑：矩阵可以带来“剪切(shear)”】
+//   上面英文注释就点明了："mainly to represent a rotation **or shear** transformation"。
+//   任意 2×2 矩阵包含**剪切**变形，而 db::Trans/ICplxTrans 这类变换类
+//   **不支持剪切**。因此：
+//     · 不要期望“任意矩阵都能对应到某个 db::Trans/ICplxTrans”；
+//     · 若你把一个带剪切的矩阵当作变换使用，几何会被拉伸成平行四边形，
+//       而这是变换类无法表达的形态。
+//
+// 【坐标类型的选择】
+//   matrix_2d<DCoord> = db::Matrix2d   浮点版    —— 常规使用
+//   matrix_2d<Coord>  = db::IMatrix2d  整数版    ★ 注意：矩阵元素本质是浮点乘法，
+//                                                  整数版会产生舍入，慎用
+//   3D 同理：Matrix3d / IMatrix3d。
+//
+// 【2D 矩阵的存储】四个元素 m11 m12 m21 m22，对应
+//       | m11  m12 |
+//       | m21  m22 |
+//   作用到向量上的语义见类内 operator* 的说明。
+//
+// 【默认构造是“零矩阵”而非单位矩阵 —— 需要留意】
+//   默认构造把所有元素置 0（见下面默认构造函数）。
+//   若你需要单位变换，应使用 `db::Matrix2d::unit()`（若提供）或显式构造单位矩阵，
+//   而**不要**假设默认构造就是单位阵。
+// [[ZH-END]]
 /**
  *  @brief A class representing a 2d matrix, mainly to represent a rotation or shear transformation of 2d vectors
  */
+// [[ZH]] 功能：2×2 矩阵，用于表示二维向量/点的旋转变换（也能表示剪切，见文件头说明）。
+// [[ZH]] 参数：C = 坐标类型；typedef 见文件末尾（Matrix2d 为浮点、IMatrix2d 为整数）。
+// [[ZH]] 兼容性：它提供了与 dbTrans.h 中变换类**同名**的类型别名
+// [[ZH]]           （target_coord_type / coord_type / displacement_type / inverse_trans），
+// [[ZH]]           因此可以像变换那样被泛型代码（如 insert_with_trans<Trans>）接受。
 template <class C>
 class DB_PUBLIC matrix_2d
 {
@@ -478,12 +524,26 @@ private:
   double m_m11, m_m12, m_m21, m_m22;
 };
 
+// [[ZH-BEGIN]]
+// ★ 与 dbTrans.h 相同的命名模式：db::Matrix2d 不是独立类，而是模板别名。
+//
+//   db::Matrix2d  = matrix_2d<DCoord>  → 浮点版（常规使用）
+//   db::IMatrix2d = matrix_2d<Coord>   → 整数版
+//     ★ 但矩阵乘法本质是**浮点乘加**，整数版会把每步结果舍入到整数，
+//       多次拼接后误差会明显累积。除非确知需要整数，否则用 Matrix2d。
+//
+//   db::Matrix3d  / db::IMatrix3d       → 对应的三维版本（见下方 matrix_3d）
+// [[ZH-END]]
 typedef matrix_2d<db::DCoord> Matrix2d;
 typedef matrix_2d<db::Coord> IMatrix2d;
 
 /**
  *  @brief A class representing a 3d matrix, mainly to represent a rotation, shear or perspective transformation of 2d vectors
  */
+// [[ZH]] 功能：3×3 矩阵，用于三维旋转变换（同样能表示剪切）。
+// [[ZH]] 用途：主要在需要三维几何的场景（少数：如三维视图/导入格式）中使用；
+// [[ZH]]       二维版图处理**几乎总是**用 matrix_2d。
+// [[ZH]] 注意：同上——它只能表达线性变换，**没有平移**（平移由配套的变换类承担）。
 template <class C>
 class DB_PUBLIC matrix_3d
 {
