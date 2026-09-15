@@ -77,6 +77,35 @@ public:
  *  Edge pair sets are created by Region::width_check for example. Edge pair sets
  *  can be converted to polygons or to individual edges.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **边对集合 (EdgePairs)** —— DRC 违规的标准表示。
+//
+// 【为什么它不能重用 Edges/Region（本类存在的理由）】
+//   DRC 违规几乎总是“两条边之间的关系不合规”：
+//     · 间距不足 → 一对相邻边太近；
+//     · 宽度不足 → 同一条线两侧的边太近；
+//     · 包围不足 → 内/外边关系不对。
+//   ★ 关键两点：违规标记**没有面积**（因此不能用 Region），
+//     且**必须成对**（Edges 只有单条边）。故专门有 EdgePairs。
+//   英文注释还说明了它的**来源**：例如由 `Region::width_check` 产生。
+//
+// 【★ 元素类型与一个直接影响正确性的性质】
+//   本集合的元素是 **db::EdgePair**（见 dbEdgePair.h），它带有
+//   **有向 / 对称** 两种模式：对称模式下 (e1,e2) 与 (e2,e1) 视为同一对象。
+//   ★ 这**直接影响去重与比较**：忽略对称标志会让同一条违规被算两次。
+//     使用集合运算/归档违规时请把这一点带入考虑。
+//
+// 【★★ 与其它三个家族同构】
+//   Region / Edges / EdgePairs / Texts 共享“**门面 + 委托 + 多实现**”架构
+//   （见 dbShapeCollection.h 与 dbRegion.h 的说明）；
+//   本文件另含 **EdgePairFilterBase**，与 PolygonFilterBase 同构
+//   （见 dbRegionDelegate.h），用于 `filtered (...)` 挑选符合条件边对。
+//
+// 【英文注释提到的转换能力】
+//   “Edge pair sets can be converted to polygons or to individual edges.”
+//   ★ 实用价值：违规标记可转成面（用于画高亮框）或转回单边。
+//     这也意味着“违规”能与其他几何运算组合起来做二次分析。
+// [[ZH-END]]
 class DB_PUBLIC EdgePairs
   : public db::ShapeCollection
 {

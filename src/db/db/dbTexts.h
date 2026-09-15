@@ -73,6 +73,38 @@ public:
  *  can be converted to polygons (representing a small box around the text's point) or to dot-like
  *  edges representing the point of the text.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **文本集合 (Texts)** —— 标签（位置 + 字串）的集合。
+//
+// 【它是什么】
+//   上面英文注释：`Texts are convenient objects describing labels (a point and a text).`
+//   即一组 db::Text（位置 + 内容），见 dbText.h。
+//
+// 【★★ 为什么“文本集合”需要被当作几何集合来用（本类的存在价值）】
+//   文本本身不是几何（无面积，见 dbText.h 的说明），但**有位置**。
+//   而在版图检查/网表提取中，我们常常需要“把标签当成几何来处理”：
+//     · “这个标签落在哪个多边形里？” → 需要把文本转成**面**；
+//     · “哪些标签互相重合/靠近？”   → 需要把文本转成**点/边**。
+//   因此本类提供了**与几何的相互转换**，英文注释已点出两种：
+//     · 转成多边形（polygon）—— 在文本位置周围生成一个小方框；
+//     · 转成点状边（dot-like edges）—— 表示文本那个位置。
+//   ★ 实用意义：把文本“几何化”之后，就能直接复用整套 Region/Edges 运算
+//     （布尔、包含、选择……），无需为文本再写一套逻辑。
+//
+// 【★ 同样采用“门面 + 委托”架构】
+//   与 Region/Edges/EdgePairs 同构（见 dbShapeCollection.h）。
+//   本文件另含一个 TextFilterBase（与 PolygonFilterBase 同构，见 dbRegionDelegate.h）。
+//
+// 【典型来源】
+//   上面英文提到：**由能提供文本的递归图形迭代器创建**
+//   （见 dbRecursiveShapeIterator.h 中的 text 遍历）。
+//   即“把版图里某一层的所有文本收集起来”。
+//
+// 【★ 一个易混点】
+//   本类叫 Texts（集合）而不是 Text（单个文本对象）。
+//   集合操作（选择/转换/遍历）在本类；单个文本的属性（位置/字串/字号）
+//   在 db::Text（dbText.h）。同理：Edges vs Edge、Region vs Polygon。
+// [[ZH-END]]
 class DB_PUBLIC Texts
   : public db::ShapeCollection
 {

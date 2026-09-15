@@ -57,6 +57,42 @@ class Edges;
  *  Edge sets can contain degenerated edges. Such edges are some which have identical start and end points.
  *  Such edges are basically points which have some applications, i.e. as markers for certain locations.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **边集合 (Edges)** —— 与 db::Region 同构的“边版本”集合。
+//
+// 【它是什么】
+//   上面英文注释说得很准：一组边，**不要求构成闭合轮廓**。
+//   ★ 与 Region 的关键区别：
+//     Region 是“**面**”（多边形集合，能算面积）；
+//     Edges 是“**线**”（边集合，没有面积，但能算长度与边间关系）。
+//   两者常配合：Region 做布尔得到面，Edges 做“边检查”（间距、长度）。
+//
+// 【★★ 与 Region 共享同一套架构（见 dbRegion.h / dbShapeCollection.h）】
+//   Edges 同样是 **门面 + 委托 + 多个实现**：
+//       db::Edges                    ← 门面
+//          └─ EdgesDelegate          ← 抽象接口
+//                 ├─ FlatEdges        平铺
+//                 ├─ DeepEdges        层次化
+//                 ├─ EmptyEdges       空
+//                 └─ OriginalLayerEdges  指向版图某层
+//   ★ 因此两个家族的方法名与语义几乎一一对应 ——
+//     学会 Region 之后，本家族基本可以类推。
+//
+// 【★ 三个与 Region 不同的概念】
+//   1) **可以包含退化边 (degenerate edges)**：
+//      即起止点相同的边（本质是一个点）。
+//      英文注释说明其用途：“as markers for certain locations”，即**位置标记**。
+//      ★ 所以看到 Edges 里长度为 0 的边不是错误，它可能是有意为之。
+//   2) **merge 的含义不同**：
+//      Edges 的 merge 是把**首尾相接的边串成更长的边**；
+//      Region 的 merge 是去重叠、变闭合面。★ 同名不同义，别混。
+//   3) **没有“闭合”与“带孔”概念**：边不构成面，自然没有孔。
+//
+// 【典型用途】
+//   · DRC 的间距/宽度检查（输出往往进一步变成 EdgePairs）；
+//   · 从 Region 取出轮廓作为边来处理（Region::edges ()）；
+//   · 作为几何谓词的输入（如“点是否在某边上”）。
+// [[ZH-END]]
 
 class DB_PUBLIC Edges
   : public db::ShapeCollection
