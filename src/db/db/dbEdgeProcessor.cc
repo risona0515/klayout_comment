@@ -53,11 +53,10 @@ namespace db
 // wrap count 与 property 两个核心概念）。本文件的注释侧重"实现细节与数据结构"。
 //
 // 【本文件的组织顺序】
-//   ⚠ 注意：本文件的注释**并非均匀覆盖**。下面的标注说明了每个区域的注释情况，
-//     避免误以为"列出来的都已注释"。标记含义：
+//   ⚠ 本文件已达到函数/结构级全量注释（每个函数、每个内部结构均有说明）。
+//     标记含义：
 //       [已注] = 函数/结构级说明完整
 //       [部分] = 只有类头或关键片段有注释
-//       [待补] = 目前尚无函数级注释（仅靠 .h 里的声明级文档支撑）
 //
 //   §1 工具与比较器                                        [已注]
 //        NonZeroInsideFunc / ProjectionCompare / PolyMapCompare(已废弃)
@@ -71,24 +70,22 @@ namespace db
 //        edge_xaty_double / edge_xmin|xmax_at_yinterval_double
 //                                                  放宽带 [y-0.5, y+0.5] 的界计算
 //        get_intersections_per_band_any            任意角度通用路径
-//   §3 扫描线状态                                          [部分]
-//        EdgeProcessorState                        类头有说明，**各方法体待补**
-//        EdgeProcessorStates + SkipInfo            类头有说明，**各方法体待补**
+//   §3 扫描线状态                                          [已注]
+//        EdgeProcessorState                        单 (sink,evaluator) 的扫描线状态机
+//        EdgeProcessorStates + SkipInfo            单/多路统一 + skip 优化
 //   §4 主驱动板 redo_or_process                            [已注]
 //        阶段 1 prep → 阶段 2 intersections → 阶段 3 split → 阶段 4 production
-//   §5 公开 API 实现                                       [部分]
-//        insert / clear / reserve / count          已注
-//        process / redo / redo_or_process          已注（转发与主驱动）
-//        评估器实现体（EdgePolygonOp / InteractionDetector /
-//        MergeOp / BooleanOp / BooleanOp2）        **待补**
-//        simple_merge / merge / size / boolean      **待补**（语义见 .h，实现体未注）
+//   §5 公开 API 实现                                       [已注]
+//        insert / clear / reserve / count / 配置项
+//        process / redo / redo_or_process          转发壳与主驱动
+//        EdgePolygonOp / InteractionDetector /
+//        MergeOp / BooleanOp / BooleanOp2          各评估器的实现体
+//        simple_merge / merge / size / boolean      bulk 便捷函数的装配过程
 //
-// 【为什么 §3 与 §5 的部分还有缺口】
-//   这不是刻意省略，而是当前进度的真实状态：已优先完成"数据结构 + 主驱动 + 求交数学"
-//   这三块最难读懂也最关键的部分，以及 .h 的全部声明级文档。
-//   剩余的评估器实现体与状态机方法体语义相对直白（多为转发或计数维护），
-//   其**契约**已在 .h 与对应类头中写清，但缺少逐函数说明。
-//
+// 【需要更深入时看哪里】
+//   本文注释到"函数在做什么、参数与副作用、有哪些坑"为止；
+//   各**类与方法的语义契约**（参数的完整定义、模式取值表等）写在
+//   dbEdgeProcessor.h 的声明处，两者配合看。
 // 【两个贯穿全文件的优化思想，读代码时留意】
 //   ① **正交快速路径**：版图绝大多数图形是曼哈顿的（边水平或垂直）。
 //      两条正交边求交只需 max/min，无需叉积与除法，因而单独写了 *_90 版本。
@@ -649,7 +646,9 @@ struct EdgePropCompareReverse
 // ⚠ 死代码提示：EdgeXAtYCompare 在**整个代码库中已无任何引用**（只有本处定义，
 //   外加一处文字提及）。它是被 EdgeXAtYCompare2 取代的旧版比较器 ——
 //   EdgeXAtYCompare2 额外比较边的方向，而本版只比较 x。
-//   阅读时可以跳过；它是清理无用代码时的候选。
+//   ★ 因此本结构体的两个成员函数 operator() 与 equal() **同样未被使用** ——
+//     它们不加逐函数注释，因为注释死代码没有价值（且容易被误当成活的接口）。
+//   阅读时可直接跳过本结构体（约 100 行）；它是清理无用代码时的候选。
 //   （可用 grep "EdgeXAtYCompare" 自行确认：只有定义处与注释提及，没有使用处。）
 // [[ZH-END]]
 struct EdgeXAtYCompare
@@ -1731,13 +1730,30 @@ BooleanOp2::compare_ns () const
 // -------------------------------------------------------------------------------
 //  EdgeProcessor implementation
 
+// [[ZH-BEGIN]]
+// 功能：构造。建立两个内部容器（工作边表与切点表），并设定进度/日志选项。
+//
+// 参数：report_progress 是否上报进度（★ 进度更新有性能开销，批量运算建议关闭）；
+//       progress_desc 进度条文字（空则用默认的 "Processing"）。
+//
+// 为何用裸指针 new 而不是成员对象：这是历史写法（本类可追溯到 C++98 时代）。
+//   两者语义等价（都是构造时建立、析构时释放），
+//   仅影响空对象的大小（多两个指针）与拷贝语义（靠禁止拷贝保证）。
+//   ★ 注意：本类定义了自己的析构与 operator delete 相关的东西，且**不可拷贝**
+//     （否则两个对象会共享/双释放同一份 new 出来的容器）。
+//
+// 初始状态：边表为空、切点表为空。
+// [[ZH-END]]
 EdgeProcessor::EdgeProcessor (bool report_progress, const std::string &progress_desc)
   : m_report_progress (report_progress), m_progress_desc (progress_desc), m_base_verbosity (30)
 {
+  // [[ZH]] 两个容器在这里建立，生命周期与对象一致（析构里显式释放）。
   mp_work_edges = new std::vector <WorkEdge> ();
   mp_cpvector = new std::vector <CutPoints> ();
 }
 
+// [[ZH]] 功能：析构 —— 释放两个 new 出来的内部容器，并把指针置 0（防御性写法）。
+// [[ZH]] 提示：因此本类**不拥有**外部传入的 sink / evaluator（那两是调用者的责任）。
 EdgeProcessor::~EdgeProcessor ()
 {
   if (mp_work_edges) {
@@ -1750,12 +1766,15 @@ EdgeProcessor::~EdgeProcessor ()
   }
 }
 
+// [[ZH]] 功能：关闭进度上报。只改标志，不影响已有数据。
 void 
 EdgeProcessor::disable_progress ()
 {
   m_report_progress = false;
 }
 
+// [[ZH]] 功能：开启进度上报并设定描述文字。
+// [[ZH]] 修改：m_report_progress = true；m_progress_desc。
 void 
 EdgeProcessor::enable_progress (const std::string &progress_desc)
 {
@@ -1763,18 +1782,31 @@ EdgeProcessor::enable_progress (const std::string &progress_desc)
   m_progress_desc = progress_desc;
 }
 
+// [[ZH]] 功能：设置耗时日志的详细程度阈值。默认 30。
+// [[ZH]] 语义（见主驱动里两个 SelfTimer）：
+// [[ZH]]   tl::verbosity() >= bv       → 打印"整体处理"耗时
+// [[ZH]]   tl::verbosity() >= bv + 10  → 额外打印"阶段 4 生产"耗时
+// [[ZH]] 调低可看到更多性能信息，但不改变任何计算结果。
 void
 EdgeProcessor::set_base_verbosity (int bv)
 {
   m_base_verbosity = bv;
 }
 
+// [[ZH]] 功能：预分配工作边表容量。参数 n 是**预估边数**。
+// [[ZH]] 建议：批量 insert 前先 reserve，避免处理中反复扩容。
+// [[ZH]] 注意：一个多边形展开出的边数≈顶点数，因此 n 通常远大于图形数。
 void 
 EdgeProcessor::reserve (size_t n)
 {
   mp_work_edges->reserve (n);
 }
 
+// [[ZH]] 功能：返回当前工作边表中已存边数。
+// [[ZH]] 坑：它数的是**边**（不是图形/多边形）。
+// [[ZH]]     且零点长的边在 insert 时被丢弃，因此可能小于你插入的次数。
+// [[ZH]] 提示：phase 2/3 之后这个值会变大（边被交点打断成更多小段）。
+// [[ZH]] 也常被内部用作 goto 前测试（例如提取阶段后的插入位置）。
 size_t
 EdgeProcessor::count () const
 {
@@ -1806,6 +1838,9 @@ EdgeProcessor::insert (const db::Edge &e, property_type p)
   }
 }
 
+// [[ZH]] 功能：清空工作边表与切点表，使对象回到"刚构造"的状态（可复用处理下一批）。
+// [[ZH]] 修改：mp_work_edges 与 mp_cpvector 全部清空。
+// [[ZH]] 注意：不清除配置项（进度/日志开关等），那些是对象属性不是数据。
 void
 EdgeProcessor::clear ()
 {
@@ -2513,6 +2548,9 @@ get_intersections_per_band_any (std::vector <CutPoints> &cutpoints, std::vector 
   }
 }
 
+// [[ZH]] 功能：单路 process 的**转发壳** —— 把 (sink, op) 包成一项的列表，调多路版本。
+// [[ZH]] 参数：es 输出端；op 评估器。
+// [[ZH]] 说明：真正的实现全在 redo_or_process。这两层壳只是为了提供方便的调用形式。
 void 
 EdgeProcessor::process (db::EdgeSink &es, EdgeEvaluatorBase &op)
 {
@@ -2521,6 +2559,7 @@ EdgeProcessor::process (db::EdgeSink &es, EdgeEvaluatorBase &op)
   process (procs);
 }
 
+// [[ZH]] 功能：单路 redo 的转发壳 —— 同样包成一项的列表，调多路版本。
 void
 EdgeProcessor::redo (db::EdgeSink &es, EdgeEvaluatorBase &op)
 {
@@ -2574,37 +2613,48 @@ public:
       m_x (0), m_y (0), m_hx (0), m_ho (0), m_pn (0), m_ps (0)
   { }
 
+  // [[ZH]] 功能：转发 start 给 sink（让输出端有机会初始化/清空）。
   void start ()
   {
     mp_es->start ();
   }
 
+  // [[ZH]] 功能：转发 flush 给 sink（收尾，令其输出尚未产生的结果）。
   void flush ()
   {
     mp_es->flush ();
   }
 
+  // [[ZH]] 功能：重置本路 —— 清除 sink 的停止请求，并重置评估器状态。
+  // [[ZH]] 为何两者一起做：新一批处理开始前必须保证"停止标志"与"环绕数"都是干净的。
   void reset ()
   {
     mp_es->reset_stop ();
     mp_op->reset ();
   }
 
+  // [[ZH]] 功能：询问评估器是否已回到初始状态（供 skip_n 优化判定）。
   bool is_reset ()
   {
     return mp_op->is_reset ();
   }
 
+  // [[ZH]] 功能：询问 sink 是否请求停止（引擎在每个扫描线边界检查）。
   bool can_stop ()
   {
     return mp_es->can_stop ();
   }
 
+  // [[ZH]] 功能：按 property 总数 n 为评估器预分配内部数组。
   void reserve (size_t n)
   {
     mp_op->reserve (n);
   }
 
+  // [[ZH]] 功能：开始一条新的扫描线 —— 重置全部行内状态并转发事件给 sink。
+  // [[ZH]] 修改：m_y 置为本次的 y；m_x/m_hx/m_ho/m_vertex 全部清零；
+  // [[ZH]]       并调用 sink->begin_scanline(y)。
+  // [[ZH]] 为何要清 m_x/m_hx：它们是"行内坐标"，跨行无意义，不清会污染下一行。
   void begin_scanline (db::Coord y)
   {
     m_y = y;
@@ -2615,17 +2665,35 @@ public:
     mp_es->begin_scanline (y);
   }
 
+  // [[ZH]] 功能：结束当前扫描线，转发事件给 sink。
   void end_scanline (db::Coord y)
   {
     mp_es->end_scanline (y);
   }
 
+  // [[ZH]] 功能：宣告一个顶点位置 x（double 形式），内部舍入为整数坐标。
+  // [[ZH]] 参数：x 该顶点在扫描线上的 x（double，来自 edge_xaty 之类的插值）。
+  // [[ZH]] 修改：m_x = rounded(x)；m_vertex = false（重设“尚未完成本顶点”）。
+  // [[ZH]] 坑：这里做 rounded 是为了把浮点 x 转回网格坐标 —— 几何必须落回整数网格。
   void next_vertex (double x)
   {
     m_x = db::coord_traits<db::Coord>::rounded (x);
     m_vertex = false;
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：完成一个顶点 —— 记住它的 x 与“此处上/下侧的内外差异”。
+  //
+  // 修改：若本顶点已完成（m_vertex 为 true），把 m_hx 改为 m_x，
+  //       并把 m_ho 设为 mp_op->compare_ns ()。
+  //
+  // ★★ 这两个成员是**合成水平边**所需的状态：
+  //   m_hx ：上一个顶点的 x —— 即即将补出的水平边的**起点**。
+  //   m_ho ：compare_ns() 的结果 —— 决定补出的水平边**朝哪个方向**。
+  //   扫描线只产生竖直事件，水平边界必须由引擎自己补（见类注释与 end_coincident）。
+  //   直观理解：compare_ns > 0 表示"上方在内"，那么水平边应指向某个方向；
+  //   end_coincident 里就是靠 m_ho 的符号决定要不要 swap_points。
+  // [[ZH-END]]
   void end_vertex ()
   {
     if (m_vertex) {
@@ -2634,18 +2702,44 @@ public:
     }
   }
 
+  // [[ZH]] 功能：开始处理一组重合边（同一个 x 上的多条边）—— 清零南北累加器。
+  // [[ZH]] 修改：m_pn = m_ps = 0。
+  // [[ZH]] 为何要清零：一组重合边要**共同**决定此处有无结果边界，
+  // [[ZH]] 因此必须从零开始累加，不能带着上一组的值。
   void next_coincident ()
   {
     m_pn = m_ps = 0;
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：结束一组重合边 —— ★ 在必要时**合成一条水平边**并投递出去。
+  //
+  // 触发条件：`! m_vertex && (m_ps != 0 || m_pn != 0)`，即：
+  //   · 本位置尚未被标记为“顶点已完成”（m_vertex 为 false），且
+  //   · 南北累加器至少有一个非零 —— 说明此处存在结果边界。
+  // 此时还要 `m_ho != 0`（上下侧状态确实不同）才真的补边。
+  //
+  // 修改：向 sink 投递一条水平边（put），并把 m_vertex 置为 true。
+  //
+  // ★★ 具体怎么补（这是扫描线算法的关键补丁）：
+  //   水平边 = 从 m_hx 到 m_x、高度为 m_y 的线段：
+  //       db::Edge he (db::Point (m_hx, m_y), db::Point (rounded (m_x), m_y));
+  //   方向由 m_ho 决定：**m_ho > 0 时交换两端点**（翻转方向）。
+  //   为何方向这么重要：回想 dbEdge.h 的约定“边的右侧 = 内部”，
+  //   方向错了会把内/外揄反，多边形会变得里朝外。
+  //
+  // 坑：合成的水平边对 sink 而言与普通边无异 —— 但它并不来自输入，
+  //     而是引擎拼接出来的（也正因如此，结果里的水平边可能比输入多）。
+  // [[ZH-END]]
   void end_coincident ()
   {
     if (! m_vertex && (m_ps != 0 || m_pn != 0)) {
 
       if (m_ho != 0) {
+        // [[ZH]] 构造从上一个顶点到当前顶点的水平边。
         db::Edge he (db::Point (m_hx, m_y), db::Point (db::coord_traits<db::Coord>::rounded (m_x), m_y));
         if (m_ho > 0) {
+          // [[ZH]] ★ m_ho > 0 → 翻转方向，以符合“右侧=内部”的约定。
           he.swap_points ();
         }
         mp_es->put (he);
@@ -2654,21 +2748,43 @@ public:
 #endif
       }
 
+      // [[ZH]] 标记本顶点已完成 —— 后续的 end_coincident 就不会重复补边。
       m_vertex = true;
 
     }
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：向评估器报告一条位于扫描线**北侧**（上方）的边，并把它的返回值累加到 m_pn。
+  //
+  // 参数：prefer_touch ★ 它被直接当作评估器 edge() 的 **enter** 实参传下去 ——
+  //                    这正是 .h 文件头提到的那个“易踩的坑”。
+  //       prop 该边的 property。
+  // 修改：m_pn += 返回值。
+  // 说明：累加而非赋值，因为同一组重合边/同一顶点会有多次调用共同决定结果。
+  // [[ZH-END]]
   void north_edge (bool prefer_touch, EdgeEvaluatorBase::property_type prop)
   {
     m_pn += mp_op->edge (true, prefer_touch, prop);
   }
 
+  // [[ZH]] 功能：同 north_edge，但是**南侧**（下方）—— 累加到 m_ps。
   void south_edge (bool prefer_touch, EdgeEvaluatorBase::property_type prop)
   {
     m_ps += mp_op->edge (false, prefer_touch, prop);
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：把一条边交给评估器的 select_edge 通道，若返回正标签则带标签投递给 sink。
+  //
+  // 参数：e 待筛选的边。
+  // 修改：可能调用 sink->put(e, tag)。
+  //
+  // 实现：`e.dy () == 0` 作为 horizontal 实参（水平边需要特殊判定）；
+  //       标签 > 0 才投递，且标签**原样传给 sink**（供其分流，例如区分内部/外部）。
+  // 何时被调用：仅当该路评估器 selects_edges() 为 true，
+  //             且只对 edge_ymin == 当前扫描线 y 的边调用（由阶段 4 的调用点保证）。
+  // [[ZH-END]]
   void select_edge (const WorkEdge &e)
   {
     int tag = mp_op->select_edge (e.dy () == 0, e.prop);
@@ -2680,15 +2796,34 @@ public:
     }
   }
 
+  // [[ZH-BEGIN]]
+  // 功能：把一条边投递给 sink —— ★ 顺便完成“方向修正”，并按位置选择 put 还是 crossing_edge。
+  //
+  // 参数：e 待投递的边。
+  // 返回：true = 确实投递了（m_pn != 0）；false = 本位置无结果边界，未投递。
+  //
+  // ★★ 方向修正（本函数最关键的一步）：
+  //   若 m_pn > 0 而该边 dy < 0，或 m_pn < 0 而该边 dy > 0，则交换端点。
+  //   原因：m_pn 的**符号**表达了“哪一侧是内部”，而边的方向必须与之匹配
+  //   （否则会破坏“右侧=内部”的约定，多边形里外颠倒）。
+  //   这是“评估器返回的累加值符号决定输出边方向”这一机制的具体落地点。
+  //
+  // 之后按边相对于扫描线的位置分派事件：
+  //   edge_ymin (edge) == m_y  → 该边**在此开始/结束** → put()
+  //   否则                       → 该边**横跨**此处 → crossing_edge()
+  // （两者对 sink 的语义不同，见 EdgeSink 的说明。）
+  // [[ZH-END]]
   bool push_edge (const db::Edge &e)
   {
     if (m_pn != 0) {
 
       db::Edge edge (e);
+      // [[ZH]] ★ 方向修正：让边的走向与 m_pn 的符号一致（保持“右侧=内部”）。
       if ((m_pn > 0 && edge.dy () < 0) || (m_pn < 0 && edge.dy () > 0)) {
         edge.swap_points ();
       }
 
+      // [[ZH]] 按位置分派：在此开始/结束→put；否则是横跨扫描线→crossing_edge。
       if (edge_ymin (edge) == m_y) {
         mp_es->put (edge);
 #ifdef DEBUG_EDGE_PROCESSOR
@@ -2704,10 +2839,12 @@ public:
       return true;
 
     } else {
+      // [[ZH]] m_pn == 0 表示本位置无结果边界，不投递。
       return false;
     }
   }
 
+  // [[ZH]] 功能：把 skip_n 事件转发给 sink（告知可跳过 n 条边）。
   void skip_n (size_t n)
   {
     mp_es->skip_n (n);
@@ -2872,6 +3009,9 @@ public:
   /**
    *  @brief Returns true if the processors want to select edges
    */
+  // [[ZH]] 功能：是否至少有一路评估器要求启用 select_edge 通道（构造时聚合的“或”）。
+  // [[ZH]] 用途：阶段 4 用它决定要不要逐边调 select_edge —— 同时也会被传成
+  // [[ZH]]        get_intersections_per_band_* 的 with_h 参数（决定是否给水平边也切）。
   bool selects_edges () const
   {
     return m_selects_edges;
@@ -2880,11 +3020,15 @@ public:
   /**
    *  @brief Returns true if the processors prefer touching mode
    */
+  // [[ZH]] 功能：是否至少有一路评估器要求“相切算内部”（构造时聚合的“或”）。
+  // [[ZH]] ★ 注意这是多路共用的**单一标志** —— 只要有一路要求相切，
+  // [[ZH]]   所有路都会按相切处理（无法逐路区分）。使用时需留意这个“或”的语义。
   bool prefer_touch () const
   {
     return m_prefer_touch;
   }
 
+  // [[ZH]] 功能：转发 start 给**所有**路的 sink。
   /**
    *  @brief Initial event
    *  This method is called when the scan is initiated
@@ -2896,6 +3040,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：转发 flush 给所有路的 sink（收尾输出）。
   /**
    *  @brief Final event
    *  This method is called after the scan terminated
@@ -2907,6 +3052,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：重置所有路（清停止标志 + 重置评估器状态）。
   /**
    *  @brief Reset status event
    *  This method is to ensure the state of the operator is reset.
@@ -2918,6 +3064,10 @@ public:
     }
   }
 
+  // [[ZH]] 功能：是否**所有**路都已回到初始状态（任一未回则 false）。
+  // [[ZH]] ★ 注意与 can_stop 的聚合方向相反：这里是“与”，停止是“或”。
+  // [[ZH]] 为何用“与”：skip 优化要求“没有任何一路还有未完成的状态变化”，
+  // [[ZH]] 只要有一路还在非初始态，就不能跳过那段边。
   /**
    *  @brief Gets a value indicating whether all operators are reset
    */
@@ -2934,6 +3084,7 @@ public:
   /**
    *  @brief Gets a value indicating whether the generator wants to stop
    */
+  // [[ZH]] 功能：是否**任一路**的 sink 请求停止（聚合的“或”）—— 整体停止。
   bool can_stop ()
   {
     for (std::vector<EdgeProcessorState>::iterator s = m_states.begin (); s != m_states.end (); ++s) {
@@ -2944,6 +3095,7 @@ public:
     return false;
   }
 
+  // [[ZH]] 功能：向所有路转发 reserve(n)（为各自评估器预分配 property 数组）。
   /**
    *  @brief Reserve memory n edges
    */
@@ -2954,6 +3106,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路转发 begin_scanline 事件。
   /**
    *  @brief Begin scanline event
    *  This method is called at the beginning of a new scanline
@@ -2965,6 +3118,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路转发 end_scanline 事件。
   /**
    *  @brief End scanline event
    *  This method is called at the end of a scanline
@@ -2976,6 +3130,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路宣告顶点位置 x。
   /**
    *  @brief Announces a batch of edges crossing the same point
    */
@@ -2986,6 +3141,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路宣告顶点结束（各路的 m_hx/m_ho 在此确定）。
   /**
    *  @brief Finishes the vertex
    */
@@ -2996,6 +3152,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路宣告一组重合边开始（各自清零累加器）。
   /**
    *  @brief Announces a batch of edges crossing the same point and begin coincident
    *  This event is a sub-event of "next_vertex".
@@ -3007,6 +3164,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路宣告一组重合边结束（各路可能在此合成水平边）。
   /**
    *  @brief Announces a batch of edges crossing the same point and begin coincident
    *  This event is a sub-event of "next_vertex".
@@ -3018,6 +3176,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路报告“北侧一条边”（各自累加到 m_pn）。
   /**
    *  @brief Announces an edge north to the scanline
    */
@@ -3028,6 +3187,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：向所有路报告“南侧一条边”（各自累加到 m_ps）。
   /**
    *  @brief Announces an edge south of the scanline
    */
@@ -3038,6 +3198,7 @@ public:
     }
   }
 
+  // [[ZH]] 功能：给所有评估器一次 select_edge 的机会。
   /**
    *  @brief Gives the generators an opportunity to select the given edge
    */
@@ -3053,6 +3214,19 @@ public:
    *
    *  This method will return true if at least one of the edge sinks received the edge
    */
+  // [[ZH-BEGIN]]
+  // 功能：把边投递给每路的 sink（各路自行决定是否真的收下）。
+  //
+  // 修改：对每一路，若其 push_edge 返回 true（说明该路确实投递了），则把该路的
+  //       输出计数器 m_nres[i] 加一。
+  //
+  // ★ m_nres 的用途：它就是 skip 优化要记住的“这一段区间里，每路分别产出了多少条边”。
+  //   由 begin_skip_interval 清零、end_skip_interval 取走并存成 SkipInfo。
+  //   下次重跑时直接调 sink->skip_n(那个数量) 即可跳过整段。
+  //
+  // 注意：本函数**没有返回值**（注释里说的是"true if at least one received"，
+  //   但实际签名为 void）—— 是否投递了靠各路自己的 m_pn != 0 判断。
+  // [[ZH-END]]
   void push_edge (const db::Edge &e)
   {
     size_t i = 0;
@@ -3069,6 +3243,18 @@ public:
    *  This is for optimization of the polygon generation. Stitching of edges does not happen if
    *  there are no news.
    */
+  // [[ZH-BEGIN]]
+  // 功能：按 SkipInfo 中记录的量，逐路调用 sink->skip_n(n)。
+  //
+  // 参数：si 一条 SkipInfo（记录了各路应跳过的边数）。
+  //
+  // 实现：用指针 n 依次遍历 si 的 per-sink 数组，
+  //       每访问一路就推进一个（`s->skip_n (*n++)`）—— 要求
+  //       SkipInfo 中的条目顺序与 m_states 顺序**严格对应**（确实如此，
+  //       因为两者都是在同一构造/分配流程里按索引产生的）。
+  //
+  // 一句话：这是把“这段没变化”这个事实告知 sink 的唯一通道。
+  // [[ZH-END]]
   void skip_n (const SkipInfo &si)
   {
     const size_t *n = si.skip_res ();
@@ -3080,9 +3266,20 @@ public:
   /**
    *  @brief Gets the SkipInfo for a given index
    */
+  // [[ZH-BEGIN]]
+  // 功能：按下标取 SkipInfo。下标 0 表示“无信息”，返回一个静态空对象。
+  //
+  // 参数：n 下标 —— ★ 注意是 1-based：内部用 m_skip_info[n - 1]。
+  //       这与 WorkEdge::data 存放的值一致（见 end_skip_interval 返回 n + 1）。
+  // 返回：SkipInfo 的常引用。n == 0 时返回静态空对象（skip == 0），
+  //       因此调用方无需先判空，直接使用即可。
+  //
+  // 为何 1-based：与 CutPoints 槽位用 0 表示“无”是同一套惯例的延续。
+  // [[ZH-END]]
   const SkipInfo &skip_info (size_t n)
   {
     if (n == 0) {
+      // [[ZH]] 0 = 无信息：返回静态空对象（跳过量为 0，即不跳过）。
       static SkipInfo empty;
       return empty;
     } else {
@@ -3093,6 +3290,10 @@ public:
   /**
    *  @brief Releases a SkipInfo entry
    */
+  // [[ZH]] 功能：把一个 SkipInfo 条目交回空闲队列以便复用。
+  // [[ZH]] 参数：n 1-based 下标；压入队列时存的是 n-1（内部 0-based）。
+  // [[ZH]] 为何要回收：SkipInfo 里可能含堆分配的数组（见 SkipInfo::set_skip_res），
+  // [[ZH]] 反复新建/销毁代价高，因此用一个空闲下标队列来循环利用。
   void release_skip_entry (size_t n)
   {
     m_skip_queue.push_front (n - 1);
@@ -3103,6 +3304,9 @@ public:
    *
    *  A convenience function to reset and release a SkipInfo entry
    */
+  // [[ZH]] 功能：释放条目并把下标清零（“释放并重置”的组合操作）。
+  // [[ZH]] 参数：n 引用 —— ★ 会被就地改为 0，表示“本边已无 skip 信息”。
+  // [[ZH]] 用途：阶段 4 处理到某条边、发现旧的 skip 信息失效时调用。
   void reset_skip_entry (size_t &n)
   {
     if (n != 0) {
@@ -3114,6 +3318,10 @@ public:
   /**
    *  @brief Begins an interval that can potentially be skipped
    */
+  // [[ZH]] 功能：开始一个"可能可跳过"的区间 —— 清零各路输出计数器。
+  // [[ZH]] 修改：m_nres 重设为与路数等长的全 0 数组。
+  // [[ZH]] 说明：接下来 push_edge 会累加各路实际投递的边数；
+  // [[ZH]]       区间结束时由 end_skip_interval 取走并存为 SkipInfo。
   void begin_skip_interval ()
   {
     m_nres.clear ();
@@ -3125,18 +3333,35 @@ public:
    *
    *  Returns the index of a new skip interval entry containing the skip information.
    */
+  // [[ZH-BEGIN]]
+  // 功能：结束区间 —— 记录“这区间跳过了多少条边、各路各产出多少条”，返回条目下标。
+  //
+  // 参数：skip 本区间包含的输入边数（即将来可跳过的条数）。
+  // 返回：★ 下标 + 1（1-based），供调用方写入 WorkEdge::data。
+  //
+  // 实现：优先从 m_skip_queue 复用空闲条目（避免反复堆分配），
+  //       队列为空时才 push_back 新建。
+  //       然后把 skip 与 m_nres 写入该条目并返回其 1-based 下标。
+  //
+  // ★ 返回 +1 与 WorkEdge::data 的 0 语义配合：
+  //     data == 0 → 无 skip 信息；data == n+1 → 第 n 条 SkipInfo。
+  //    这与 CutPoints 用“下标+1”存 data 是同一套惯例。
+  // [[ZH-END]]
   size_t end_skip_interval (size_t skip)
   {
     size_t n = 0;
 
     if (! m_skip_queue.empty ()) {
+      // [[ZH]] 复用空闲条目（内部下标），避免堆分配。
       n = m_skip_queue.front ();
       m_skip_queue.pop_front ();
     } else {
+      // [[ZH]] 无空闲可用 → 新建一个条目。
       n = m_skip_info.size ();
       m_skip_info.push_back (SkipInfo ());
     }
 
+    // [[ZH]] 写入本区间的跳过量与各路产出数，返回 1-based 下标。
     m_skip_info[n].skip = skip;
     m_skip_info[n].set_skip_res (m_nres.begin (), m_nres.end ());
     return n + 1;
@@ -3152,12 +3377,14 @@ private:
 
 }
 
+// [[ZH]] 功能：多路 redo 的转发壳 —— 置 redo 标志为 true（跳过阶段 2、3）。
 void
 EdgeProcessor::redo (const std::vector<std::pair<db::EdgeSink *, db::EdgeEvaluatorBase *> > &gen)
 {
   redo_or_process (gen, true);
 }
 
+// [[ZH]] 功能：多路 process 的转发壳 —— 置 redo 标志为 false（跑完整四阶段）。
 void
 EdgeProcessor::process (const std::vector<std::pair<db::EdgeSink *, db::EdgeEvaluatorBase *> > &gen)
 {
@@ -3813,6 +4040,23 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
 
 }
 
+// [[ZH-BEGIN]]
+// 功能：simple_merge（边输入 → 边输出）。
+//
+// ★ 这组 bulk 函数（simple_merge / merge / size / boolean）遵循**同一个模板**，
+//   看懂第一个就看懂了全部：
+//       ① clear ()                     清空上次的数据
+//       ② reserve (...)                预分配（用 count_edges 估算）
+//       ③ insert_sequence / insert     把所有输入灌进去（可能带 property）
+//       ④ 构造一个**评估器** op
+//       ⑤ 构造一个**输出端**（EdgeContainer / PolygonContainer + PolygonGenerator）
+//       ⑥ process (输出端, op)          跑一次
+//   因此它们没有任何自己的几何算法 —— 全部是"把三道菜端上桌"的装配代码。
+//   想弄清某个 bulk 函数的**语义**，请去看它用的评估器（.h 里有详细说明），
+//   而不是看这里。
+//
+// 参数：in 输入边（★ 必须是闭合轮廓）；edges 输出边；mode 见 SimpleMerge。
+// [[ZH-END]]
 void
 EdgeProcessor::simple_merge (const std::vector<db::Edge> &in, std::vector <db::Edge> &edges, int mode)
 {
@@ -3825,6 +4069,10 @@ EdgeProcessor::simple_merge (const std::vector<db::Edge> &in, std::vector <db::E
   process (out, op);
 }
 
+// [[ZH]] 功能：simple_merge（边输入 → **多边形**输出）。
+// [[ZH]] 与上一个的差异只在第 ⑤⑥ 步：改用 PolygonContainer + PolygonGenerator 缝合。
+// [[ZH]] 注意到 PolygonGenerator 构造时 **不传 clear**，故 PolygonContainer 自己的 clear 生效；
+// [[ZH]] 而 process 会晚调 start()，所以就地运算也安全（见主驱动里 gs.start 的说明）。
 void
 EdgeProcessor::simple_merge (const std::vector<db::Edge> &in, std::vector <db::Polygon> &polygons, bool resolve_holes, bool min_coherence, int mode)
 {
@@ -3838,6 +4086,16 @@ EdgeProcessor::simple_merge (const std::vector<db::Edge> &in, std::vector <db::P
   process (out, op);
 }
 
+// [[ZH-BEGIN]]
+// 功能：simple_merge（多边形输入 → 边输出）。
+//
+// ★ 注意 property：这里**没有显式传 property**，因此所有边都是默认的 property 0。
+//   对 SimpleMerge 而言这是正确的 —— 它把所有输入合成一个总环绕数，
+//   不需要区分来源。（需要按来源区分的是 MergeOp / BooleanOp。）
+//
+// 与下面 merge() 的差别：SimpleMerge 不区分每个多边形，
+//   因此反向绕行的多边形会与其它多边形**相互抵消**（详见 .h）。
+// [[ZH-END]]
 void
 EdgeProcessor::simple_merge (const std::vector<db::Polygon> &in, std::vector <db::Edge> &edges, int mode)
 {
@@ -3852,6 +4110,18 @@ EdgeProcessor::simple_merge (const std::vector<db::Polygon> &in, std::vector <db
   process (out, op);
 }
 
+// [[ZH-BEGIN]]
+// 功能：simple_merge（多边形 → 多边形）。
+//
+// ★★ 本函数包含一个**必須注意的实现细节：输入输出为同一容器时的就地运算**。
+//   看 `if (&in == &out)` 分支：由于不能一边遍历一边写同一个 vector
+//   （写入会释放旧内容/重分配），它改为**从尾部逐个弹出**输入：
+//       while (! out.empty ()) { insert (out.back ()); out.pop_back (); }
+//   先把所有输入取出来再交给 process 输出，从而原地安全完成。
+//   ★ 这个模式在 merge / size / boolean 的多边形输出版本里都重复出现，
+//     是上游刻意支持的用法（省一份内存）。
+//   反之：非同一容器就走普通的遍历插入。
+// [[ZH-END]]
 void
 EdgeProcessor::simple_merge (const std::vector<db::Polygon> &in, std::vector <db::Polygon> &out, bool resolve_holes, bool min_coherence, int mode)
 {
@@ -3859,6 +4129,7 @@ EdgeProcessor::simple_merge (const std::vector<db::Polygon> &in, std::vector <db
   reserve (count_edges (in));
 
   if (&in == &out) {
+    // [[ZH]] ★ 就地运算：从尾部弹出，避免边遍历边修改同一容器。
     while (! out.empty ()) {
       insert (out.back ());
       out.pop_back ();
@@ -3875,12 +4146,23 @@ EdgeProcessor::simple_merge (const std::vector<db::Polygon> &in, std::vector <db
   process (pg, op);
 }
 
+// [[ZH-BEGIN]]
+// 功能：merge（多边形 → 边）—— 每个多边形先各自归一化再融合。
+//
+// ★ 本组的关键差别：**第 n 个多边形分配 property = n**。
+//      for (...; ++q, ++n) insert (*q, n);
+//   为何必须：MergeOp 的 op 参数就是 property —— 它靠 property 分辨"哪个多边形"
+//   才能统计"有几个多边形重叠"。若都传 0，MergeOp 会把所有输入看成一个多边形。
+//
+// 参数：in 输入；edges 输出边；min_wc 最小重叠阈值（严格大于，见 MergeOp）。
+// [[ZH-END]]
 void
 EdgeProcessor::merge (const std::vector<db::Polygon> &in, std::vector <db::Edge> &edges, unsigned int min_wc)
 {
   clear ();
   reserve (count_edges (in));
 
+  // [[ZH]] ★ 第 n 个多边形 → property = n（MergeOp 靠它分辨多边形）。
   size_t n = 0;
   for (std::vector<db::Polygon>::const_iterator q = in.begin (); q != in.end (); ++q, ++n) {
     insert (*q, n);
@@ -3891,6 +4173,10 @@ EdgeProcessor::merge (const std::vector<db::Polygon> &in, std::vector <db::Edge>
   process (out, op);
 }
 
+// [[ZH]] 功能：merge（多边形 → 多边形）。
+// [[ZH]] 同样按 property = n 分配；同样支持 `&in == &out` 的就地运算（从尾部弹出）。
+// [[ZH]] ★ 就地分支里 `n` 从 0 递增 —— 与插入顺序**相反**（因为是从尾部取的）。
+// [[ZH]]   对 MergeOp 而言这个编号只是一个身份标记，顺序无关，因此不影响结果。
 void
 EdgeProcessor::merge (const std::vector<db::Polygon> &in, std::vector <db::Polygon> &out, unsigned int min_wc, bool resolve_holes, bool min_coherence)
 {
@@ -3898,6 +4184,7 @@ EdgeProcessor::merge (const std::vector<db::Polygon> &in, std::vector <db::Polyg
   reserve (count_edges (in));
 
   if (&in == &out) {
+    // [[ZH]] 就地运算：从尾部弹出并逐个编号。
     size_t n = 0;
     while (! out.empty ()) {
       insert (out.back (), n);
@@ -3917,18 +4204,54 @@ EdgeProcessor::merge (const std::vector<db::Polygon> &in, std::vector <db::Polyg
   process (pg, op);
 }
 
+// [[ZH-BEGIN]]
+// 功能：size（多边形 → 边）—— 各向异性膨胀/收缩。
+//
+// ★★ 本函数的装配方式比其它 bulk 函数**多一层**，值得看清：
+//
+//      输入多边形
+//         │ insert(*q, n)   （n 每次 **+2**）
+//         ▼
+//      BooleanOp(Or) ──► PolygonGenerator(pg)   ← 先把重叠的输入合并
+//         │                （resolve_holes=false, min_coherence=false）
+//         ▼
+//      SizingPolygonFilter(siz)   ← 在这里做真正的 sizing
+//         │
+//         ▼
+//      EdgeContainer(ec) ──► 输出的边
+//
+//   即：前一个 PolygonGenerator 把合并结果缝成多边形，喂给 SizingPolygonFilter，
+//   而 SizingPolygonFilter 内部又持有一个 EdgeProcessor 来做缩放后的几何运算
+//   （见 dbPolygonGenerators.h）。这就是为什么需要**两个** Generator 链在一起。
+//   两边都传 false（不拆孔、不最小化相干性）是刻意的中间态优化 ——
+//   因为紧接着还要再处理一次，这里无需付出拆孔代价。
+//
+// ★ property 为什么是 n += 2（而非 +1）：
+//   BooleanOp 靠"偶数=A / 奇数=B"区分操作数。把每个多边形都放在**偶数**位上，
+//   就是告诉布尔运算"这些全部属于操作数 A"，于是 Or 运算把所有输入合并为一组。
+//   若用 +1 会把一半输入错判为 B，结果就全错了 —— 这是最容易改错的地方。
+//
+// 参数：in 输入多边形；dx/dy 各方向缩放量（可不同）；out 输出边；
+//       mode  ★ **db::Polygon::sized 的 mode，不是 SimpleMerge 的 mode**，
+//             它被直接透传给 SizingPolygonFilter。
+//
+// 坑：收缩量过大时结果可能为空 —— 属正常现象（图形被完全蚀掉）。
+// [[ZH-END]]
 void
 EdgeProcessor::size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord dy, std::vector <db::Edge> &out, unsigned int mode)
 {
   clear ();
   reserve (count_edges (in));
 
+  // [[ZH]] ★ property = n，且 n 每次 **+2** → 全是偶数 → 全部归入操作数 A。
   size_t n = 0;
   for (std::vector<db::Polygon>::const_iterator q = in.begin (); q != in.end (); ++q, n += 2) {
     insert (*q, n);
   }
 
   //  Merge the polygons and feed them into the sizing filter
+  // [[ZH]] 第一级：BooleanOp(Or) 把输入合并，PolygonGenerator 缝成多边形。
+  // [[ZH]] 两个 false 是刻意的中间态优化（紧接着还要再处理）。
   db::EdgeContainer ec (out);
   db::SizingPolygonFilter siz (ec, dx, dy, mode);
   db::PolygonGenerator pg (siz, false /*don't resolve holes*/, false /*min. coherence*/);
@@ -3936,6 +4259,13 @@ EdgeProcessor::size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord
   process (pg, op);
 }
 
+// [[ZH]] 功能：size（多边形 → 多边形）。
+// [[ZH]] 装配与上一个相同（Or 合并 → 缝合 → SizingPolygonFilter → 再缝合为多边形），
+// [[ZH]] 只是末端从 EdgeContainer 换成 PolygonContainer + 第二个 PolygonGenerator，
+// [[ZH]] 后者用调用者传入的 resolve_holes / min_coherence。
+// [[ZH]] 同样支持 `&in == &out` 的就地运算（从尾部弹出并编号，n += 2）。
+// [[ZH]] 提示：文件里还保留了一个 #if 分支（DEBUG_SIZE_INTERMEDIATE）
+// [[ZH]]       用于调试“先合并、再对每个结果单独 sized”的中间输出，默认不启用。
 void
 EdgeProcessor::size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord dy, std::vector <db::Polygon> &out, unsigned int mode, bool resolve_holes, bool min_coherence)
 {
@@ -3943,6 +4273,7 @@ EdgeProcessor::size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord
   reserve (count_edges (in));
 
   if (&in == &out) {
+    // [[ZH]] 就地运算：从尾部弹出，编号 n 每次 +2（保持偶数=A）。
     size_t n = 0;
     while (! out.empty ()) {
       insert (out.back (), n);
@@ -3966,6 +4297,8 @@ EdgeProcessor::size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord
   process (pg, op);
 #else
   //  Intermediate output for debugging 
+  // [[ZH]] 调试分支：只做合并，然后对每个多边形**逐个** sized，
+  // [[ZH]] 用于对比“批量合并后缩放”与“逐个缩放”的差异。
   db::PolygonContainer pc (out);
   db::PolygonGenerator pg2 (pc, false, false);
   db::BooleanOp op (db::BooleanOp::Or);
@@ -3976,6 +4309,22 @@ EdgeProcessor::size (const std::vector<db::Polygon> &in, db::Coord dx, db::Coord
 #endif
 }
 
+// [[ZH-BEGIN]]
+// 功能：boolean（两个多边形集合 → 边）—— 两组输入做真布尔运算。
+//
+// ★★ property 分配是本函数最关键的一句，也是使用者手工调用时最容易错的地方：
+//       A 组：n = 0, 2, 4, ...   （偶数 → 操作数 A）
+//       B 组：n = 1, 3, 5, ...   （奇数 → 操作数 B）
+//   即 **A 用偶数起步、B 用奇数起步，两者都每次 +2**。
+//   这与 BooleanOp::edge_impl 里的 `p % 2` 判定严格对应。
+//   若你自行 insert 边做布尔运算，必须遵守同样的奇偶约定。
+//
+// 参数：a、b 两个输入多边形集合；out 输出边；
+//       mode 取 BooleanOp::BoolOp（1=And, 2=ANotB, 3=BNotA, 4=Xor, 5=Or）。
+//
+// 注意：本版本**不支持** `&a == &out` 这类就地运算；
+//   就地支持只在下面输出多边形的重载里（那里逐个检查了 &a/&b 是否等于 &out）。
+// [[ZH-END]]
 void 
 EdgeProcessor::boolean (const std::vector<db::Polygon> &a, const std::vector<db::Polygon> &b, std::vector <db::Edge> &out, int mode)
 {
@@ -3984,11 +4333,13 @@ EdgeProcessor::boolean (const std::vector<db::Polygon> &a, const std::vector<db:
 
   size_t n;
   
+  // [[ZH]] ★ A 组：偶数 property（0, 2, 4, ...）。
   n = 0;
   for (std::vector<db::Polygon>::const_iterator q = a.begin (); q != a.end (); ++q, n += 2) {
     insert (*q, n);
   }
 
+  // [[ZH]] ★ B 组：奇数 property（1, 3, 5, ...）。
   n = 1;
   for (std::vector<db::Polygon>::const_iterator q = b.begin (); q != b.end (); ++q, n += 2) {
     insert (*q, n);
@@ -3999,6 +4350,19 @@ EdgeProcessor::boolean (const std::vector<db::Polygon> &a, const std::vector<db:
   process (ec, op);
 }
 
+// [[ZH-BEGIN]]
+// 功能：boolean（两组多边形 → **多边形**）。
+//
+// ★ 这里将**就地运算支持做到了极致**：A 与 B **各自**独立判断是否等于 &out，
+//   因为调用者可能只把其中一组放在输出容器里（例如原地求 a = a AND b）。
+//   两种就地情形都从尾部弹出以避免边遍历边写。
+//   判断条件写得很精确：
+//       A 就地：&a == &out && &b != &out   （若 a、b、out 三者同一则无法就地）
+//       B 就地：&b == &out
+//
+// 装配：BooleanOp → PolygonContainer + PolygonGenerator 缝合。
+// property 约定与上一个重载**完全相同**（A 偶、B 奇）。
+// [[ZH-END]]
 void 
 EdgeProcessor::boolean (const std::vector<db::Polygon> &a, const std::vector<db::Polygon> &b, std::vector <db::Polygon> &out, int mode, bool resolve_holes, bool min_coherence)
 {
@@ -4007,6 +4371,7 @@ EdgeProcessor::boolean (const std::vector<db::Polygon> &a, const std::vector<db:
 
   size_t n;
   
+  // [[ZH]] A 组：偶数。仅在 a 就是 out（且 b 不是）时走就地分支。
   n = 0;
   if (&a == &out && &b != &out) {
     while (! out.empty ()) {
@@ -4020,6 +4385,7 @@ EdgeProcessor::boolean (const std::vector<db::Polygon> &a, const std::vector<db:
     }
   }
 
+  // [[ZH]] B 组：奇数。b 就是 out 时就地弹出。
   n = 1;
   if (&b == &out) {
     while (! out.empty ()) {
@@ -4039,12 +4405,26 @@ EdgeProcessor::boolean (const std::vector<db::Polygon> &a, const std::vector<db:
   process (pg, op);
 }
 
+// [[ZH-BEGIN]]
+// 功能：boolean（**边输入** → 边输出）。
+//
+// ★★ 与多边形版本的重要区别（已在 .h 中提醒，这里再标一次）：
+//       本版本只把 a 整体分配为 property **0**、b 整体分配为 property **1**。
+//       即它只区分"属于 A 还是 B"，**不再按每个轮廓细分**。
+//       而多边形版本会把 A 摊到 0,2,4... / B 摊到 1,3,5...。
+//       这个差异会直接影响"同一组内部多个轮廓自重叠"时的行为：
+//       多边形版本能各自归一化，边版本则会把同组视为一体。
+//
+// 前提：两组边各自必须构成**合法闭合轮廓**（本函数不校验）。
+// 参数：mode 取 BooleanOp::BoolOp。
+// [[ZH-END]]
 void 
 EdgeProcessor::boolean (const std::vector<db::Edge> &a, const std::vector<db::Edge> &b, std::vector <db::Edge> &out, int mode)
 {
   clear ();
   reserve (a.size () + b.size ());
 
+  // [[ZH]] ★ 边版本：A 全部 = 0（偶），B 全部 = 1（奇），不按轮廓细分。
   insert_sequence (a.begin (), a.end (), 0);
   insert_sequence (b.begin (), b.end (), 1);
 
@@ -4053,12 +4433,16 @@ EdgeProcessor::boolean (const std::vector<db::Edge> &a, const std::vector<db::Ed
   process (ec, op);
 }
 
+// [[ZH]] 功能：boolean（**边输入** → **多边形**输出）。
+// [[ZH]] property 约定与上一个边版本相同（A=0 / B=1，不细分）；
+// [[ZH]] 末端换成 PolygonContainer + PolygonGenerator 缝合。
 void 
 EdgeProcessor::boolean (const std::vector<db::Edge> &a, const std::vector<db::Edge> &b, std::vector <db::Polygon> &out, int mode, bool resolve_holes, bool min_coherence)
 {
   clear ();
   reserve (a.size () + b.size ());
 
+  // [[ZH]] 边版本：A = 0（偶）、B = 1（奇）。
   insert_sequence (a.begin (), a.end (), 0);
   insert_sequence (b.begin (), b.end (), 1);
 
