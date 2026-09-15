@@ -596,51 +596,122 @@ def cmd_autofix(paths):
     return 0
 
 
-def _try_blank_line_fixes(path, lines, root, ref):
-    """Try candidate blank-line removals, returning the first that verifies.
+def _verifies_against_pristine(kept_lines, pristine, path):
+    """True if stripping markers from `kept_lines` reproduces `pristine`.
 
-    尝试若干“删除空行”的候选改动，返回第一个能通过校验的结果。
+    若从 `kept_lines` 剥离标记后能还原 `pristine`，则返回 True。
 
-    Candidates considered / 候选策略：
-      1. drop a blank line immediately after  [[ZH-END]]
-      2. drop a blank line immediately before [[ZH-BEGIN]]
-      3. drop blank lines in BOTH positions
-    Returns None if none of them makes verify pass.
-    若都无效则返回 None。
+    IMPORTANT: this must NOT go through the file-based `verify`, because that
+    compares against the git version of the path it is given -- so a temporary
+    file would appear "untracked" and verify would report success for ANY content
+    (it assumes a new file has nothing to compare against).  An earlier version of
+    autofix wrote candidates to a temp file and therefore accepted the first
+    candidate unconditionally, which made it silently wrong.
+
+    重要：这里**不能**走基于文件的 `verify`，因为它比对的是“给定路径的 git 版本”——
+    临时文件会被视为“未跟踪”，而 verify 对未跟踪文件会直接返回成功
+    （它假定新文件没有比对对象）。早先版本的 autofix 把候选写到临时文件，
+    因此会无条件接受第一个候选，导致**静默错误**。
+
+    Comparing the lines directly removes that whole failure mode.
+    直接比较行内容可以彻底消除这一失效模式。
     """
-    n = len(lines)
+    try:
+        mask, _, _ = build_removal_mask(path, kept_lines)
+    except CheckFailure:
+        return False
+    return strip_annotations(mask, kept_lines) == pristine
 
-    def is_blank(i):
-        return 0 <= i < n and lines[i].strip() == ""
 
-    def is_end(i):
-        return 0 <= i < n and lines[i].strip().startswith("//") and BLOCK_END in lines[i]
+def _try_blank_line_fixes(path, lines, root, ref):
+    """Repair missing/extra BLANK lines by aligning against the pristine file.
 
-    def is_begin(i):
-        return 0 <= i < n and lines[i].strip().startswith("//") and BLOCK_BEGIN in lines[i]
+    通过与原始文件对齐，修复**空行**的缺失或多余。
 
-    # Collect the indices to drop for each strategy.
-    # 收集每种策略要删除的下标。
-    after_end = {i + 1 for i in range(n) if is_end(i) and is_blank(i + 1)}
-    before_begin = {i - 1 for i in range(n) if is_begin(i) and is_blank(i - 1)}
+    Method / 方法：
+      1. strip the markers to get what upstream would see;
+      2. align that against the pristine lines with difflib;
+      3. keep only the differences that consist of BLANK lines -- every such
+         "insert" means we must add a blank line at that point, every such
+         "delete" means we must remove one;
+      4. map the position back into the annotated file and apply the edit;
+      5. accept the result only if it reproduces the pristine file exactly.
 
-    candidates = [sorted(after_end), sorted(before_begin),
-                  sorted(after_end | before_begin)]
+    1. 剥离标记，得到“上游会看到的”内容；
+    2. 用 difflib 与原始行对齐；
+    3. **只保留由空行构成**的差异 —— 每个 "insert" 表示该处需补一个空行，
+       每个 "delete" 表示该处需删一个空行；
+    4. 把位置映射回带注释的文件并施加改动；
+    5. 仅当结果能精确还原原始文件时才接受。
 
-    for drop in candidates:
-        if not drop:
+    This is deliberately conservative: any difference involving a non-blank line
+    (i.e. real code) makes it give up and say "inspect manually", rather than
+    guessing.  This replaces an earlier candidate-guessing approach that was
+    unreliable (it verified a temporary file, which git sees as untracked, so
+    verify accepted anything).
+    本函数刻意保守：只要差异涉及**非空行**（即真实代码），就直接放弃并提示
+    “请手工检查”，而不是猜测。它取代了早期那种“枚举候选”的做法 ——
+    那种做法不可靠（它校验的是临时文件，而 git 视其为未跟踪，导致 verify 一律通过）。
+    """
+    pristine = pristine_lines(root, os.path.relpath(os.path.abspath(path), root), ref)
+
+    try:
+        mask, _, _ = build_removal_mask(path, lines)
+    except CheckFailure:
+        return None
+    stripped = strip_annotations(mask, lines)
+
+    # Map each stripped index -> index in the annotated file.
+    # 建立「剥离后下标 -> 带注释文件下标」的映射。
+    stripped_to_file = [i for i, drop in enumerate(mask) if not drop]
+
+    import difflib
+    sm = difflib.SequenceMatcher(a=stripped, b=pristine, autojunk=False)
+
+    # Collect edits as (stripped_position, kind).  kind is "add" or "del".
+    # 收集编辑点：(剥离后位置, 类型)。
+    edits = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
             continue
-        kept = [ln for i, ln in enumerate(lines) if i not in set(drop)]
-        tmp = path + ".zhfix"
-        with open(tmp, "w", encoding=ENCODING, newline="") as fp:
-            fp.write("".join(kept))
-        try:
-            verify(tmp, root, ref)
-        except CheckFailure:
-            os.unlink(tmp)
-            continue
-        os.unlink(tmp)
-        return kept
+        a_lines = stripped[i1:i2]
+        b_lines = pristine[j1:j2]
+        # Only blank-line differences are repairable.
+        # 只有“空行”差异是可修复的。
+        if any(t.strip() for t in a_lines) or any(t.strip() for t in b_lines):
+            return None
+        if j2 - j1 > i2 - i1:
+            edits.append((i1, "add", (j2 - j1) - (i2 - i1)))
+        else:
+            edits.append((i1, "del", (i2 - i1) - (j2 - j1)))
+
+    if not edits:
+        return None
+
+    # Apply from the end so earlier positions stay valid.
+    # 从后往前施加，避免前面位置失效。
+    out = list(lines)
+    for pos, kind, count in reversed(edits):
+        if pos < len(stripped_to_file):
+            file_pos = stripped_to_file[pos]
+        else:
+            file_pos = len(out)
+        if kind == "add":
+            out[file_pos:file_pos] = ["\n"] * count
+        else:
+            removed = 0
+            i = file_pos
+            while i < len(out) and removed < count:
+                if out[i].strip() == "":
+                    del out[i]
+                    removed += 1
+                else:
+                    i += 1
+            if removed < count:
+                return None
+
+    if _verifies_against_pristine(out, pristine, path):
+        return out
     return None
 
 
