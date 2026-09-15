@@ -624,6 +624,13 @@ struct EdgePropCompareReverse
  *  @brief A compare operator for edged
  *  This operator will compare edges by their x position on the scanline
  */
+// [[ZH-BEGIN]]
+// ⚠ 死代码提示：EdgeXAtYCompare 在**整个代码库中已无任何引用**（只有本处定义，
+//   外加一处文字提及）。它是被 EdgeXAtYCompare2 取代的旧版比较器 ——
+//   EdgeXAtYCompare2 额外比较边的方向，而本版只比较 x。
+//   阅读时可以跳过；它是清理无用代码时的候选。
+//   （可用 grep "EdgeXAtYCompare" 自行确认：只有定义处与注释提及，没有使用处。）
+// [[ZH-END]]
 struct EdgeXAtYCompare
 {
   EdgeXAtYCompare (db::Coord y)
@@ -722,14 +729,31 @@ private:
  *  This operator is an extension of db::edge_xaty and will deliver
  *  the minimum x if the edge is horizontal.
  */
+// [[ZH-BEGIN]]
+// 功能：db::edge_xaty 的加强版 —— 求边在扫描线 y 处的 x，且**对水平边返回最小 x**。
+//
+// 与 db::edge_xaty 的唯一区别：当扫描线恰好落在水平边的两个端点高度之间时，
+// 本函数返回 min(x1, x2) 而不是插值结果。因为水平边没有"唯一的"扫描线交点 x，
+// 取较小的 x 可以让它在排序中稳定地落在左侧。
+//
+// 参数：e 目标边（按值传递，内部可能交换端点做归一化）；
+//       y 扫描线 y。
+// 返回：double 的 x 值。
+//
+// 与 db::edge_xaty 相同的契约：同一 (边, y) 必须返回**逐位相同**的 double，
+// 否则阶段 4 的排序会不稳定（见 EdgeXAtYCompare2 的 volatile 说明）。
+// [[ZH-END]]
 static inline double edge_xaty2 (db::Edge e, db::Coord y)
 {
+  // [[ZH]] 归一化为 p1.y <= p2.y，使同一条边只有一种参数化。
   if (e.p1 ().y () > e.p2 ().y ()) {
     e.swap_points ();
   }
 
   if (y <= e.p1 ().y ()) {
     if (y == e.p2 ().y ()) {
+      // [[ZH]] ★ 本函数的关键分支：水平边（p1.y == p2.y == y）没有唯一交点，
+      // [[ZH]] 取最小 x 以保证排序稳定、确定。
       return std::min (e.p1 ().x (), e.p2 ().x ());
     } else {
       return e.p1 ().x ();
@@ -737,6 +761,7 @@ static inline double edge_xaty2 (db::Edge e, db::Coord y)
   } else if (y >= e.p2 ().y ()) {
     return e.p2 ().x ();
   } else {
+    // [[ZH]] 线段内部插值。运算次序是契约的一部分，不可重排。
     return double (e.p1 ().x ()) + double (e.dx ()) * double (y - e.p1 ().y ()) / double (e.dy ());
   }
 }
@@ -750,40 +775,77 @@ static inline double edge_xaty2 (db::Edge e, db::Coord y)
  */
 struct EdgeXAtYCompare2
 {
+  // [[ZH]] 参数：y 当前扫描线的 y 坐标。比较结果依赖于它（边的 x 位置随 y 变化）。
   EdgeXAtYCompare2 (db::Coord y)
     : m_y (y) { }
 
+  // [[ZH-BEGIN]]
+  // 功能：★ 阶段 4 的**核心比较器** —— 决定同一扫描线上各边的处理次序。
+  //       先按"边与扫描线的交点 x"升序；x 相同时再按边的方向/上下关系定序。
+  //
+  // 参数：a、b 两条待比较的边。
+  // 返回：true 表示 a 应排在 b 之前。
+  //
+  // 【为什么需要一个"加强版"比较器，而不是简单比 x】
+  //   扫描线自下而上推进时，两条边可能**恰好相交于一点**（相切）。
+  //   此时它们的 x 相等，若不定序，处理顺序不定，环绕数就可能算错。
+  //   因此 x 相等时还必须考虑两条边的走向（dy 的符号、端点在上方还是下方），
+  //   以保证"y 前进后扫描线上的左右次序保持一致"（源码注释称之为
+  //   "preserves the scanline order"）。这是布尔运算正确性的关键细节。
+  //
+  // 【★ volatile double 是**正确性**手段，不是性能优化 —— 不要删】
+  //   见下面 HINT 注释：声明为 volatile 会强制 xa/xb 写回内存，
+  //   从而阻止编译器把浮点计算保持在 x87 寄存器中。
+  //   原因：x87 浮点寄存器是 80 位扩展精度，写回内存会截断为 64 位。
+  //   若不 volatile，同一个值可能在"寄存器中比较"和"内存中比较"时得到不同结果，
+  //   或在不同优化级别/不同编译单元下产生不同尾数 →
+  //   `xa != xb` 的结果变得不稳定 → 排序不稳定 → 结果不可复现。
+  //   volatile 把两条边都降级为 64 位 double 再比较，使得比较**逐位确定**。
+  //   删除 volatile 可能不会立刻出错，但会引入极难排查的偶发错误。
+  // [[ZH-END]]
   bool operator() (const db::Edge &a, const db::Edge &b) const
   {
     //  simple cases ..
+    // [[ZH]] 快速分支①：两条都是垂直边（dx == 0）→ 直接比 x，无需插值。
     if (a.dx () == 0 && b.dx () == 0) {
       return a.p1 ().x () < b.p1 ().x ();
     } else if (edge_xmax (a) < edge_xmin (b)) {
+      // [[ZH]] 快速分支②：a 的 x 范围完全在 b 左侧 → a 在前（无需插值）。
       return true;
     } else if (edge_xmin (a) > edge_xmax (b)) {
+      // [[ZH]] 快速分支③：a 完全在 b 右侧 → a 在后。
       return false;
     } else {
 
       //  complex case:
       //  HINT: "volatile" forces xa and xb into memory and disables FPU register optimisation.
       //  That way, we can exactly compare doubles afterwards.
+      // [[ZH]] ★ volatile 是刻意的：强制 64 位精度比较，保证结果逐位确定。
+      // [[ZH]] 这不是防编译器乱序的性能考量，而是**可复现性**的必要条件。见上方说明。
       volatile double xa = edge_xaty2 (a, m_y);
       volatile double xb = edge_xaty2 (b, m_y);
 
       if (xa != xb) {
+        // [[ZH]] x 不同：常规情形，小者在前。
         return xa < xb;
       } else if (a.dy () == 0) {
+        // [[ZH]] x 相同且 a 是水平边：让 a 排在后面（水平边不改变环绕数，
+        // [[ZH]] 放在竖直边之后处理可保持次序语义清晰）。
         return false;
       } else if (b.dy () == 0) {
+        // [[ZH]] 对称地：b 是水平边 → a 在前。
         return true;
       } else {
 
         //  In that case the edges will not intersect but rather touch in one point. This defines
         //  a sorting which preserves the scanline order of the edges when y advances.
+        // [[ZH]] ★ 两条斜/竖边在扫描线上 x 相同 → 它们在此点相切。
+        // [[ZH]] 必须给出确定次序，否则 y 前进后左右关系可能反转，导致环绕数算错。
 
         db::Edge ea (a);
         db::Edge eb (b);
 
+        // [[ZH]] 归一化方向为 dy >= 0，使"方向比较"有统一基准。
         if (ea.dy () < 0) {
           ea.swap_points ();
         }
@@ -791,11 +853,13 @@ struct EdgeXAtYCompare2
           eb.swap_points ();
         }
 
+        // [[ZH]] fa/fb：该边是否向上延伸越过当前扫描线（决定"继续活跃"与否）。
         bool fa = ea.p2 ().y () > m_y;
         bool fb = eb.p2 ().y () > m_y;
 
         if (fa && fb) {
           //  Both edges advance
+          // [[ZH]] 两边都继续向上：用叉积符号比较斜率，保证"更左的边"有确定次序。
           return db::vprod_sign (ea, eb) < 0;
         } else if (fa || fb) {
           //  Only one edge advances - equality
@@ -1357,10 +1421,27 @@ EdgeProcessor::count () const
   return mp_work_edges->size ();
 }
 
+// [[ZH-BEGIN]]
+// 功能：把一条边加入处理队列，并标记其来源 property。
+//
+// 参数：e 待插入的边；p 来源标签（见 dbEdgeProcessor.h 文件头对 property 的说明）。
+//
+// ★ 注意：**退化边（零长度，p1 == p2）会被静默丢弃**。
+//   没有任何返回值、日志或异常提示 —— 这是刻意的（退化边没有方向，
+//   无法参与环绕数计算，留着只会制造麻烦），但对调用者来说是"看不见的行为"。
+//   如果你发现"插入的边数比 count() 少"，原因通常就在这里。
+//
+// 其他说明：
+//   · 本函数**不做任何几何合法性校验**：自相交、非闭合的边序列都会被照单全收，
+//     只会产生奇怪的结果而不会报错。调用者需自行保证输入有意义。
+//   · 不预分配容量。批量插入前请先调用 reserve() 以避免反复扩容。
+//   · 插入的顺序不重要 —— 阶段 2 会重新排序（除非只调用 redo()）。
+// [[ZH-END]]
 void
 EdgeProcessor::insert (const db::Edge &e, property_type p)
 {
   if (e.p1 () != e.p2 ()) {
+    // [[ZH]] 只插入非退化边。零长度边在此被静默忽略（见上方说明）。
     mp_work_edges->push_back (WorkEdge (e, p));
   }
 }
@@ -1886,6 +1967,40 @@ EdgeProcessor::redo (db::EdgeSink &es, EdgeEvaluatorBase &op)
 namespace
 {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  EdgeProcessorState —— 单路 (sink, evaluator) 的扫描线状态机
+// ============================================================================
+//
+// 【角色】阶段 4 的"执行单元"。每有一个 (sink, evaluator) 对，就有一个本对象。
+//   它负责把"工作边表"翻译成对评估器的调用，再把评估器的裁决翻译成对 sink 的投递。
+//   多路输出时由 EdgeProcessorStates 持有多个本对象。
+//
+// 【它维护的状态（见文件末尾成员）】
+//   mp_es / mp_op : 输出端与评估器（裸指针，生命周期由调用者保证）。
+//   m_y           : 当前扫描线的 y。
+//   m_x           : 当前顶点的 x（double 舍入后的整数），随顶点推进。
+//   m_hx          : ★ 合成水平边的起点 x —— 即"上一个顶点"的 x。
+//   m_ho          : ★ compare_ns() 的结果，决定合成出的水平边朝向哪个方向。
+//   m_pn / m_ps   : ★ 北侧/南侧的**累加器**，即评估器 edge() 返回值之和。
+//                   非零表示"此处有结果边界"，符号决定输出边方向。
+//   m_vertex      : 是否正处于一个顶点上（用于判断何时该合成水平边）。
+//
+// 【为什么需要"合成水平边"】
+//   扫描线算法只处理"竖直方向的事件"，因此结果里天然缺少水平方向的边界段。
+//   但多边形必须闭合，所以引擎要在两个相邻顶点之间**补出水平边**：
+//       从 m_hx 到当前 m_x，在 y = m_y 处。
+//   补边时方向由 m_ho（compare_ns 的结果）决定：
+//       若 m_ho > 0 则交换端点（见 end_coincident）。
+//   这就是 dbEdgeProcessor.h 里 compare_ns() 存在的全部理由。
+//
+// 【关键方法的调用序列】（阶段 4 每处理一个扫描线上的位置时）
+//   begin_scanline(y) → next_vertex(x) → north_edge/south_edge(...)
+//   → end_vertex() → [next_coincident() ... end_coincident()] → end_scanline(y)
+//
+// 提示：本类的 north_edge/south_edge 直接把形参 prefer_touch 传给了评估器的
+//       enter 形参 —— 这正是 dbEdgeProcessor.h 文件头提到的那个"易踩的坑"。
+// [[ZH-END]]
 class EdgeProcessorState
 {
 public:
@@ -2044,6 +2159,9 @@ private:
 };
 
 //  NOTE: set this to 0 to force memory-allocation storage for SkipInfo always (testing)
+// [[ZH]] skip_info_storage_threshold：SkipInfo 用"内联存储"还是"堆分配"的切换阈值。
+// [[ZH]] 设为 0 可强制总是走堆分配 —— 这是留给测试用的开关（注释里写明 "testing"），
+// [[ZH]] 用于验证两种存储路径行为一致。生产环境保持 1。
 const size_t skip_info_storage_threshold = 1;
 
 /**
@@ -2053,6 +2171,30 @@ const size_t skip_info_storage_threshold = 1;
  *  class provides a single interface to handle the case of single and multiple
  *  receivers in a uniform way.
  */
+// [[ZH-BEGIN]]
+// 功能：阶段 4 的门面（多路复用器）——
+//       把"单路"与"多路"两种情形统一成同一个调用界面。
+//
+// 【为什么需要这层包装】
+//   EdgeProcessor 支持一次扫描同时喂多个 (sink, evaluator) 对。
+//   若没有本类，阶段 4 的循环里到处都要写"是单路还是多路"的分支判断。
+//   本类把这些分支收敛到一处：内部持有**一个或多个** EdgeProcessorState，
+//   对外统一提供 start/reset/reserve/begin_scanline/... 等方法，
+//   内部再逐个转发（或聚合，如 can_stop 取各路的"或"）。
+//
+// 【它聚合出的全局查询】
+//   can_stop()      : 任意一路 sink 请求停止 → 整体停止。
+//   prefer_touch()  : 任意一路评估器要求"相切算内部" → 整体按相切处理。
+//                     注意：多路时这是一个"或"，会同时影响所有路。
+//   selects_edges() : 任意一路需要逐边通道 → 整体启用该通道。
+//
+// 【SkipInfo 与 skip 优化】
+//   嵌套的 SkipInfo 结构（见下）实现了一个**记忆化**优化：
+//   若某一段边的处理没有改变任何一路的内部状态，就把"这一段跳过了多少条边"
+//   记下来，下次 redo/process 时直接跳到段尾并调用 sink->skip_n()，
+//   从而免去逐条边调用评估器的开销。
+//   它用 WorkEdge::data 存放条目下标 —— 这正是 data 字段在阶段 4 的"用途"。
+// [[ZH-END]]
 class EdgeProcessorStates
 {
 public:
@@ -2457,31 +2599,96 @@ EdgeProcessor::process (const std::vector<std::pair<db::EdgeSink *, db::EdgeEval
   redo_or_process (gen, false);
 }
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  redo_or_process —— 算法主驱动板（process/redo 的共同实现）
+// ============================================================================
+//
+// 【入参】
+//   gen  : [(sink1, eval1), (sink2, eval2), ...] —— 支持一次扫描多路输出。
+//          单路调用（process(es,op)）在更上层被包装成只含一项的 gen。
+//   redo : ★ 关键开关，决定是否重跑昂贵的阶段 2、3：
+//            false (= process) → 跑完整四阶段
+//            true  (= redo)    → **跳过阶段 2、3**，只清空 data 后直接进入阶段 4
+//          另外注意 redo 模式下不会重排 mp_work_edges，因为它已被 process 排好序了。
+//
+// 【四个阶段】
+//   step 1  preparation    清空切点表、统计 property 个数、准备进度对象。
+//                          redo 模式在此清空各 WorkEdge 的 data 字段
+//                          （把阶段 4 遗留的 skip 下标清掉，同时也就丢弃了
+//                           阶段 1-3 的 CutPoints 关联 —— 因为已经不需要了）。
+//   step 2  find intersections
+//                          按 edge_ymin 排序，然后**分带(band)**扫描，
+//                          逐带调用 get_intersections_per_band_90 / _any 求交，
+//                          把交点登记为 CutPoints。
+//                          ★ 最耗时阶段。正交输入走 *_90 快速路径。
+//   step 3  create new edges from the ones with cutpoints
+//                          对每条有切点的边，沿边方向排序切点，生成若干小段
+//                          （原来的 1 条边变成 N 条 WorkEdge），从而保证
+//                          "所有边互不相交"这一前提在阶段 4 成立。
+//   step 4  compute the result edges
+//                          自下而上扫描线：对每条扫描线按 x 排序（用
+//                          EdgeXAtYCompare2），把重合边按 property 分组，
+//                          调用评估器的 edge()/select_edge()，把结果投递给 sink。
+//                          ★ 唯一响应 can_stop() 的阶段。
+//
+// 【"分带(band)"是什么意思，为什么要它】
+//   朴素做法是"每移动一条扫描线就重算一次活跃边集合"，代价高。
+//   这里改为把 y 轴切成若干**带**：一次取出足够多的边（目标是把约 50% 的边
+//   纳入当前带，经验系数 fill_factor），在这一带内统一处理。
+//   带内只需处理"本带涉及的边"，减少了反复筛选的开销。
+//   具体做法见下面 step 2 中那个 do/while：不断把 ymin ≤ yy 的边纳入，
+//   直到纳入的新边数量达到 n * fill_factor 的规模。
+//
+// 【进度报告】用 tl::AbsoluteProgress，把估算出的工作量(todo_max)按阶段切分：
+//   阶段 2 占约 1/5，阶段 3 占约 1/5，其余留给阶段 4。
+//   只有 m_report_progress 为真时才创建进度对象 ——
+//   因为进度更新本身有成本，批量运算时应关闭（见构造函数参数 report_progress）。
+//
+// 【空输入】mp_work_edges 为空时直接 start()+flush() 后返回
+//   （仍要调用，让 sink 有机会初始化/收尾）。
+// [[ZH-END]]
 void
 EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::EdgeEvaluatorBase *> > &gen, bool redo)
 {
+  // [[ZH]] SelfTimer：当 tl::verbosity() 达到 m_base_verbosity 时，
+  // [[ZH]] 在作用域结束自动打印本次处理耗时。这是"性能观测"的轻量手段，
+  // [[ZH]] 不改变任何计算结果。阈值可用 set_base_verbosity() 调整（默认 30）。
   tl::SelfTimer timer (tl::verbosity () >= m_base_verbosity, "EdgeProcessor: process");
 
+  // [[ZH]] gs 把"单路/多路 sink+evaluator"统一成一个入口，
+  // [[ZH]] 并聚合各路的 can_stop、prefer_touch、selects_edges 等查询。见 EdgeProcessorStates。
   EdgeProcessorStates gs (gen);
 
+  // [[ZH]] 这两个标志由**所有**评估器统一决定（多路时取"或"）：
+  // [[ZH]]   prefer_touch  → 会被当作 edge() 的 enter 实参传下去（见 EdgeProcessorState）
+  // [[ZH]]   selects_edges → 是否启用逐边 select_edge 通道
   bool prefer_touch = gs.prefer_touch ();
   bool selects_edges = gs.selects_edges ();
   
+  // [[ZH]] y     ：当前扫描线的 y 坐标。
+  // [[ZH]] future：指向"尚未纳入当前带的下一条边"（边已按 ymin 升序排好）。
   db::Coord y;
   std::vector <WorkEdge>::iterator future;
 
   //  step 1: preparation
+  // [[ZH]] ===== 阶段 1：准备 =====
 
   if (mp_work_edges->empty ()) {
+    // [[ZH]] 空输入：仍要通知 sink 开始与结束（否则某些 sink 的内部状态无法收尾）。
     gs.start ();
     gs.flush ();
     return;
   }
 
+  // [[ZH]] 清空切点表。注意 mp_cpvector 是复用的成员，上次处理的切点必须丢弃。
   mp_cpvector->clear ();
 
   //  count the properties
 
+  // [[ZH]] 统计 property 的最大值，从而得知总共有多少种来源标签。
+  // [[ZH]] 评估器的内部数组（如 BooleanOp 的 m_wcv_n/m_wcv_s）按 property 索引，
+  // [[ZH]] 因此需要这个上界来 resize。注意这里取的是 max+1（下标从 0 开始）。
   property_type n_props = 0;
   for (std::vector <WorkEdge>::iterator e = mp_work_edges->begin (); e != mp_work_edges->end (); ++e) {
     if (e->prop > n_props) {
@@ -2492,10 +2699,12 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
 
   //  prepare progress
 
+  // [[ZH]] 进度报告的总量刻度。下面把 1000000 按阶段切分作为各阶段的配额。
   size_t todo_max = 1000000;
 
   std::unique_ptr<tl::AbsoluteProgress> progress;
   if (m_report_progress) {
+    // [[ZH]] 仅在启用时才创建进度对象（进度更新有性能开销）。
     if (m_progress_desc.empty ()) {
       progress.reset (new tl::AbsoluteProgress (tl::to_string (tr ("Processing")), 1000));
     } else {
@@ -2507,6 +2716,7 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
 
   size_t todo_next = 0;
   size_t todo = todo_next;
+  // [[ZH]] 阶段 1（准备）占总量约 1/5。
   todo_next += (todo_max - todo) / 5;
 
 
@@ -2514,24 +2724,39 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
 
     //  redo mode: skip the intersection detection step and clear the data
 
+    // [[ZH]] ===== redo 捷径：跳过阶段 2、3 =====
+    // [[ZH]] 把每条工作边的 data 清零。这一步同时完成了两件事：
+    // [[ZH]]   ① 丢弃阶段 1-3 遗留的 CutPoints 下标（阶段 4 不再需要它们）；
+    // [[ZH]]   ② 把阶段 4 上次写入的 skip 下标清掉，使本次从头计算 skip 信息。
+    // [[ZH]] 正因为跳过了阶段 2、3，redo 远快于 process，但其正确性
+    // [[ZH]] **完全依赖**此前已经跑过一次 process（边已被打断、已按 ymin 排序）。
     for (std::vector <WorkEdge>::iterator c = mp_work_edges->begin (); c != mp_work_edges->end (); ++c) {
       c->data = 0;
     }
 
+    // [[ZH]] redo 模式下阶段 2、3 不执行，但进度配额照常推进，保持百分比一致。
     todo = todo_next;
     todo_next += (todo_max - todo) / 5;
 
   } else {
 
     //  step 2: find intersections
+    // [[ZH]] ===== 阶段 2：求交点（最耗时的阶段）=====
+    // [[ZH]] 先按 ymin 升序排序，使扫描可以自下而上推进。
+    // [[ZH]] ★ 这里用的是 edge_ymin_compare（整数包围盒比较），
+    // [[ZH]]   内部以 operator< 兜底保证全序 —— 排序必须是确定的，否则结果不可复现。
     std::sort (mp_work_edges->begin (), mp_work_edges->end (), edge_ymin_compare<db::Coord> ());
 
+    // [[ZH]] y 从最小 ymin 开始；future 指向尚未纳入当前带的边。
     y = edge_ymin ((*mp_work_edges) [0]);
     future = mp_work_edges->begin ();
 
+    // [[ZH]] 外层循环：每次处理一个"带(band)"。
+    // [[ZH]] current 是当前带处理的起点，循环体结束后会推进到带尾。
     for (std::vector <WorkEdge>::iterator current = mp_work_edges->begin (); current != mp_work_edges->end (); ) {
 
       if (m_report_progress) {
+        // [[ZH]] 按"已处理的边数占比"更新阶段 2 的进度。
         double p = double (std::distance (mp_work_edges->begin (), current)) / double (mp_work_edges->size ());
         progress->set (size_t (double (todo_next - todo) * p) + todo);
       }
@@ -2541,12 +2766,19 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
 
       //  Use as many scanlines as to fetch approx. 50% new edges into the scanline (this
       //  is an empirically determined factor)
+      // [[ZH]] ★ 决定本带的 y 范围：不断把 ymin ≤ yy 的边纳入，
+      // [[ZH]]   直到新纳入的边数达到"本带起点处边数 n 的 fill_factor 倍"（约 1.5x）。
+      // [[ZH]]   直觉：一次多纳入一些边，摊薄"每移动一条扫描线就重建活跃集"的开销。
+      // [[ZH]]   n 只在第一轮确定（= 初始带内边数），后续轮以它为基准。
       do {
 
+        // [[ZH]] 把 ymin ≤ yy 的边全部纳入本带。
         while (future != mp_work_edges->end () && edge_ymin (*future) <= yy) {
           ++future;
         }
 
+        // [[ZH]] 取下一带的边界：下一条边的 ymin；若没有了则用 Coord 的最大值
+        // [[ZH]] （相当于"一直延伸到无穷远"，把剩余全部纳入）。
         if (future != mp_work_edges->end ()) {
           yy = edge_ymin (*future);
         } else {
@@ -2554,6 +2786,7 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
         }
 
         if (n == 0) {
+          // [[ZH]] 第一轮：记下本带的初始边数，作为后续扩张的基准。
           n = std::distance (current, future);
         }
 
@@ -2596,6 +2829,29 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
     //  Hint: when we create the edges from the cutpoints we use the projection to sort the cutpoints along the
     //  edge. However, we have some freedom to connect the points which we use to avoid "z" configurations which could
     //  create new intersections in a 1x1 pixel box.
+    // [[ZH-BEGIN]]
+    // ===== 阶段 3：按切点把边打断 =====
+    // 目的：把"有切点的边"拆成若干小段，使阶段 4 面对的所有边**互不相交**。
+    //       这是扫描线算法的前提条件（见 dbEdgeProcessor.h 文件头）。
+    //
+    // 上面英文 Hint 说的是本阶段最微妙的一处：
+    //   切点沿边的先后顺序由 ProjectionCompare 排序决定（唯一）；
+    //   但**相邻切点之间的连线方式存在自由度** —— 当切点落在同一格的角上时，
+    //   可以选择不同的拐法。这里刻意选择能避免"Z 字形"的连法，
+    //   因为 Z 字形会在 1×1 DBU 的方格内制造新的自相交，
+    //   而阶段 4 假定输入无自相交。下面那些
+    //       `ne = db::Edge (pll, ne.p2 ());` / `ne = db::Edge (ne.p1 (), pll);`
+    //   就是在调整拐法，消除 Z 形。（变量 pll = "previous of previous"）
+    //
+    // 实现要点：
+    //   · 原地生成：用写入下标 nw 在同一个 vector 内"就地覆盖"已处理过的位置，
+    //     只有确实变多时才 push_back。跑完后把尾部多余元素 erase 掉。
+    //     这样避免了额外容器，是性能敏感的写法（读起来要小心 nw 与 n 的关系）。
+    //   · ew.data 用完即清零（`ew.data = 0;`）—— 因为 data 要留给阶段 4 存 skip 下标。
+    //   · **水平边被直接丢弃**（`ew.dy () == 0 && ! selects_edges`）：
+    //     扫描线算法不需要水平边参与（它们不改变环绕数），除非评估器显式要求逐边投递。
+    //     这解释了为什么"结果里见不到水平边"是正常的。
+    // [[ZH-END]]
 
     todo = todo_next;
     todo_next += (todo_max - todo) / 5;
@@ -2704,6 +2960,34 @@ EdgeProcessor::redo_or_process (const std::vector<std::pair<db::EdgeSink *, db::
 
   //  step 4: compute the result edges 
   
+  // [[ZH-BEGIN]]
+  // ===== 阶段 4：扫描线求值并输出 =====
+  // 这是唯一真正"产出结果"的阶段，也是唯一响应停止请求的阶段。
+  //
+  // 【★ 为什么 gs.start() 放在这么靠后的位置】
+  //   上面英文注释已经点明：start() 延迟到**读完输入之后**才调用。
+  //   原因是 EdgeContainer 之类的 sink 在 start() 里会（按需）清空输出容器。
+  //   如果输入容器和输出容器是**同一个**（就地运算，很常见的用法），
+  //   过早清空就会把还没读完的输入一起清掉。
+  //   因此约定：start() 必须晚于"输入已被完全读取"。
+  //
+  // 【本阶段的循环结构】
+  //   按 y 自下而上推进，每一步处理"当前 y 处的所有边事件"：
+  //     ① 把 ymin <= y 的边纳入本次处理的区间 [f0, future)
+  //     ② 用 EdgeXAtYCompare2 在这个区间内**按 x 排序**
+  //        （这是扫描线的核心：同一条扫描线上必须按 x 从左到右处理）
+  //     ③ 计算下一个 y（yy）：取"活跃边的 ymax"与"下一条边的 ymin"中的较小者
+  //     ④ 处理本 y 处的边事件，调用评估器，投递结果
+  //     ⑤ y = yy，继续
+  //   循环条件里的 `! gs.can_stop ()` 就是停止请求的唯一检查点 ——
+  //   也就是说停止只在**扫描线边界**生效，当前扫描线内的边仍会被处理完。
+  //
+  // 【关于 tl_assert (future->data == 0)】
+  //   这不是业务逻辑，而是**开发期自检**：它验证"进入阶段 4 时所有边的 data 都已清零"。
+  //   因为 data 在阶段 1-3 被用作 CutPoints 下标，在阶段 4 要改用作 skip 下标，
+  //   若忘记清零就会出现"把旧的切点下标误当 skip 下标用"的隐蔽错误。
+  //   见 WorkEdge 对 data 字段双重复用的说明。
+  // [[ZH-END]]
   gs.start (); // call this as late as possible. This way, input containers can be identical with output containers ("clear" is done after the input is read)
 
   gs.reset ();

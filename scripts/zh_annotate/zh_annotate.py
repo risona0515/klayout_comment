@@ -218,6 +218,81 @@ def strip_annotations(mask, lines):
     return [ln for ln, drop in zip(lines, mask) if not drop]
 
 
+def check_insertion_context(path, lines, mask):
+    """Check that no annotation line lands where a `//` comment changes meaning.
+
+    检查没有注释行落在「加一个 // 会改变语义」的位置。
+
+    Stripping annotations back to the pristine file proves we did not *edit* any
+    code.  It does NOT by itself prove that inserting a `//` line is harmless in
+    every context.  Three contexts make it harmful:
+
+      1. after a line-continuation backslash -- line splicing (phase 2) happens
+         BEFORE comment removal (phase 3), so the annotation can end up inside
+         the joined logical line and comment out the rest of a macro;
+      2. inside a raw string literal R"(...)" -- the text becomes string content;
+      3. inside a block comment -- harmless to the compiler, but the annotation
+         becomes invisible to a reader, which defeats its purpose.
+
+    剥离注释能证明我们没有**修改**任何代码，但不能证明在每个位置上插入一行
+    `//` 都是无害的。有三种上下文会让它有害：
+      1. 紧跟在续行反斜杠之后 —— 行拼接（第 2 阶段）先于注释移除（第 3 阶段），
+         注释可能被拼进同一条逻辑行，从而把宏的其余部分注释掉；
+      2. 落在原始字符串 R"(...)" 内部 —— 注释会变成字符串内容；
+      3. 落在块注释内部 —— 对编译器无害，但读者看不到，失去注释的意义。
+
+    This is a heuristic lexer, not a full C++ parser: it is deliberately
+    conservative and may under-report exotic constructs, never over-report.
+    这里是一个启发式词法扫描，不是完整的 C++ 解析器：刻意保守，
+    可能漏报冷门写法，但不会误报。
+    """
+    problems = []
+    in_block_comment = False
+    in_raw_string = False
+    prev_code = None
+
+    for lineno, (line, is_ann) in enumerate(zip(lines, mask), 1):
+        if is_ann:
+            if prev_code is not None and prev_code.rstrip("\n").endswith("\\"):
+                problems.append(
+                    "%s:%d: annotation follows a line-continuation backslash "
+                    "(it may be spliced into the preceding macro) / "
+                    "注释紧跟在续行反斜杠之后（可能被拼进上一行的宏）"
+                    % (path, lineno))
+            if in_raw_string:
+                problems.append(
+                    "%s:%d: annotation inserted inside a raw string literal / "
+                    "注释落在原始字符串内部" % (path, lineno))
+            if in_block_comment:
+                problems.append(
+                    "%s:%d: annotation inserted inside a block comment / "
+                    "注释落在块注释内部" % (path, lineno))
+            continue
+
+        prev_code = line
+
+        # Strip an obvious trailing line comment so a '//' inside it does not
+        # confuse the state tracking.  Quotes are left alone on purpose: getting
+        # this wrong only causes under-reporting, which is the safe direction.
+        # 去掉明显的行尾注释，避免其中的 // 干扰状态跟踪。
+        # 刻意不处理引号：判断错只会漏报，属于安全方向。
+        code = line.split("//")[0] if '"' not in line.split("//")[0] else line
+
+        # Toggle raw-string state.  Only handles the R"( ... )" form.
+        # 切换原始字符串状态，只处理 R"( ... )" 形式。
+        if 'R"' in code:
+            in_raw_string = not in_raw_string
+
+        # Track block comments, ignoring one-line /* ... */ pairs.
+        # 跟踪块注释，忽略单行 /* ... */ 对。
+        if "/*" in code and "*/" not in code:
+            in_block_comment = True
+        elif "*/" in code:
+            in_block_comment = False
+
+    return problems
+
+
 def pristine_lines(root, relpath, ref):
     """Fetch the pristine version of a file from git.
 
@@ -296,6 +371,13 @@ def verify(path, root=None, ref=None):
     lines = read_lines(path)
     mask, n_marked, n_blocks = build_removal_mask(path, lines)
     stripped = strip_annotations(mask, lines)
+
+    # Guard the orthogonal risk: stripping proves we edited nothing, but not that
+    # a `//` line is harmless where we put it.  See check_insertion_context.
+    # 检查正交风险：剥离能证明没改代码，但不能证明插入的 // 在位置上无害。
+    context_problems = check_insertion_context(path, lines, mask)
+    if context_problems:
+        raise CheckFailure("\n".join(context_problems))
 
     try:
         original = pristine_lines(root, relpath, ref)
