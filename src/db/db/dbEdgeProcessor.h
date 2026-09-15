@@ -37,6 +37,72 @@
 namespace db
 {
 
+// [[ZH-BEGIN]]
+// ============================================================================
+//  dbEdgeProcessor.h —— 边的布尔运算引擎（scanline / 扫描线算法）
+// ============================================================================
+//
+// 【这个文件解决什么问题】
+//   给定一堆多边形（或一堆边），求它们的 并 / 交 / 差 / 异或，或做尺寸放大缩小
+//   (sizing)，或判断哪些边落在哪些多边形内部……这些问题都可归约为同一个核心操作：
+//   **求一组边的布尔组合**。EdgeProcessor 就是这个核心操作的实现。
+//
+// 【它在整个库中的位置】
+//       db::Region / db::Edges          ← 高层抽象（图层、集合运算）
+//              ↓ 委托
+//       db::ShapeProcessor              ← 把 Shape/Polygon/Path 拆成边（前端包装）
+//              ↓ 委托
+//       db::EdgeProcessor   ★ 你在这里 ★ ← 只认边，做真正的布尔运算
+//              ↓ 输出
+//       db::EdgeSink 的实现类            ← EdgeContainer / PolygonGenerator / TrapezoidGenerator
+//
+//   ★ 最重要的一点认知：EdgeProcessor **不认识多边形**，它只认识边。
+//     多边形在这里被"打散成一圈边"，算完后再由 sink 重新缝合成多边形。
+//     这解释了两件事：(a) 为什么本文件通篇只有 Edge 没有 Polygon；
+//     (b) 为什么输出端要做"缝合(stitching)"这种看起来额外的工作。
+//
+// 【算法总览 —— 四个阶段】
+//   全部工作由 EdgeProcessor::redo_or_process() 驱动，分四个阶段：
+//     阶段 1  prep            把插入的边整理成 WorkEdge 数组，统计 property 个数
+//     阶段 2  intersections   求所有边的交点（关键阶段，最耗时）
+//     阶段 3  split           按交点把边"打断"，使各段互不相交
+//     阶段 4  production      用扫描线自下而上扫过，对每段边询问评估器，决定去留并投递
+//
+//   ★ 只有阶段 4 会响应"停止请求(can_stop)"；阶段 2、3 是不可中断的。
+//
+// 【核心概念一：wrap count（wc，环绕数 / 圈数）】
+//   ⚠ 本文件最容易误解的地方：名字里的 "wc" 在不同类中含义**不同**！
+//     · GenericMerge / SimpleMerge 中：wc = **有向环绕数 (winding number)**，
+//         即"从该点向上引一条射线，穿过多边形边界的有向次数"。
+//         正负号取决于边的方向 —— 这正是"边的右侧 = 内部"约定的用武之地。
+//     · MergeOp 中：wc = **当前张开的（即重叠的）多边形个数**，不是环绕数。
+//     · BooleanOp 中：同时维护"每个 property 的环绕数"以及"A 的张开的个数/B 的张开的个数"。
+//   看到 wc 请先确认属于哪一类，否则模式参数的语义一定会理解错。
+//
+// 【核心概念二：property（属性 / 来源标签）】
+//   每条边带一个整数 property（类型 size_t），用来**分辨这条边来自哪个输入**：
+//     · BooleanOp：约定 bit0 表示操作数（偶数 → A，奇数 → B）
+//     · merge()：  property = 输入多边形的下标
+//     · size()：   property = 输入下标 * 2
+//     · EdgePolygonOp：0 = 多边形自身，1 及以上 = 待过滤的边
+//   换言之，property 是"边的身份证"，评估器靠它区分不同输入。
+//
+// 【如何上手阅读本文件】
+//   建议顺序：
+//     ① EdgeSink            —— 输出端接口，最简单，先搞清"结果怎么出去"
+//     ② EdgeEvaluatorBase 及其子类 —— "每段边如何决定去留"
+//     ③ EdgeProcessor 公开 API     —— insert / process / simple_merge / boolean / size
+//   具体实现在 dbEdgeProcessor.cc，那里有按阶段划分的更细注释。
+//
+// 【命名撞车警告 —— 极易踩坑】
+//   db::EdgeProcessor         = 本文件的 scanline 布尔运算引擎
+//   db::EdgeProcessorBase     = shape_collection_processor<Edge,Edge> 的别名
+//                               （定义在 dbEdgesDelegate.h）
+//                               ★ 名字里多了 "Base"，但它**不是本类的基类**，
+//                                 而是 Edges 集合的处理框架，与 scanline 算法无关。
+//   db::ExtendedEdgeProcessor (dbEdgesUtils.h)、db::PolygonToEdgeProcessor
+//                               (dbRegionProcessors.h) 同样与本类无关。
+// [[ZH-END]]
 struct WorkEdge;
 struct CutPoints;
 class EdgeSink;
@@ -50,12 +116,48 @@ class EdgeSink;
  *
  *  This is the base class for such edge receivers.
  */
+// [[ZH-BEGIN]]
+// 功能：EdgeProcessor 的**输出接收端**接口 —— 处理结果通过它投递出去。
+//
+//       把它理解为"结果的出口"：想知道布尔运算的结果，就实现一个 EdgeSink
+//       （或直接用现成的），传给 process()。引擎本身不知道"结果该变成什么形状"，
+//       一切由你选的 sink 决定：
+//         · EdgeContainer       → 收集成 std::vector<db::Edge>
+//         · PolygonGenerator    → 缝合成 std::vector<db::Polygon>
+//         · TrapezoidGenerator  → 分解成梯形
+//
+// ★ 投递协议（调用顺序契约，写 sink 前必须了解）：
+//       start()                 所有输入边已缓存完毕，即将开始投递
+//       └ 对每一条扫描线 y：
+//           begin_scanline(y)
+//           ├ put(edge)           该边在此 y 处开始或结束
+//           ├ put(edge, tag)      带标签版本（仅当评估器 selects_edges() 为真）
+//           ├ crossing_edge(edge) 该边"穿过"本扫描线（不在此开始/结束）
+//           ├ skip_n(n)           可整体跳过 n 条边（保证形成闭合序列）
+//           └ end_scanline(y)
+//       flush()                 全部投递完毕
+//
+// ★ 投递内容的保证（sink 实现者可以依赖这些）：
+//       1) 顺序为 scanline 序：整体自下而上（y 递增），同一扫描线内自左而右（x 递增）。
+//       2) 投递出的边**互不相交**（相交的边已在阶段 2/3 于交点处被打断）。
+//       3) start() 被调用时所有边都已缓存完成 —— 因此可在 start() 里安全地
+//          丢弃原始输入、释放临时内存（这正是 start() 存在的意义）。
+//
+// 坑：1) 所有 virtual 方法的**默认实现都是空操作**，不强制重写。
+//        因此"只关心 put()"的 sink 只需重写 put() 即可。
+//     2) skip_n(n) 是性能优化：表示"这一批边的处理产生了相同结果，可整段跳过"。
+//        默认实现就是"忽略"。若你的 sink 必须看到**每一条**边，需要留意它的存在；
+//        典型用法见 dbEdgeProcessor.cc 中的 SkipInfo 与 EdgeProcessorStates。
+//     3) 引擎可能对同一个 sink 多次调用 start()/flush()（例如后面紧跟 redo()），
+//        所以 sink 不应假设 start() 只被调用一次。
+// [[ZH-END]]
 class DB_PUBLIC EdgeSink 
 {
 public:
   /** 
    *  @brief Constructor
    */
+  // [[ZH]] 功能：构造。唯一成员 m_can_stop 初始化为 false（未请求停止）。
   EdgeSink () : m_can_stop (false) { }
 
   /** 
@@ -71,6 +173,9 @@ public:
    *  Thus, inside an implementation of this method, the original source can be
    *  discarded.
    */
+  // [[ZH]] 功能：投递开始前的回调。★ 此刻所有输入边都已缓存完毕 —— 这正是它的价值：
+  // [[ZH]]       你可以放心地在这里丢弃原始输入或释放临时内存（引擎不会再读它们）。
+  // [[ZH]] 调用时机：在第一条边投递之前，且整个投递过程**可能被调用多次**。
   virtual void start () { }
 
   /**
@@ -78,6 +183,8 @@ public:
    *
    *  This method is called after the last edge has been delivered.
    */
+  // [[ZH]] 功能：投递结束后的回调，用于收尾（例如开始缝合多边形、做统计）。
+  // [[ZH]] 坑：与 start() 一样可能被多次调用（引擎重跑时），不要假设只来一次。
   virtual void flush () { }
 
   /**
@@ -85,6 +192,9 @@ public:
    *
    *  This method delivers an edge that ends or starts at the current scanline.
    */
+  // [[ZH]] 功能：投递一条**在当前扫描线处开始或结束**的边（即"顶点事件"）。
+  // [[ZH]] 这是最常用的回调 —— 只想要结果边的 sink 覆盖它即可。
+  // [[ZH]] 注意：穿过扫描线的边不走这里，而走 crossing_edge()。
   virtual void put (const db::Edge &) { }
 
   /**
@@ -94,6 +204,9 @@ public:
    *  This version includes a tag which is generated when using "select_edge".
    *  A tag is a value > 0 returned by "select_edge".
    */
+  // [[ZH]] 功能：put 的带标签版本。tag 是评估器的 select_edge() 返回的正整数（>0），
+  // [[ZH]]       用来给同一次投递的边分类（例如 EdgePolygonOp 用 tag 区分"内部/外部"）。
+  // [[ZH]] 何时触发：仅当评估器 selects_edges() 返回 true 时才可能走这个重载。
   virtual void put (const db::Edge &, int /*tag*/) { }
 
   /**
@@ -105,6 +218,18 @@ public:
    *  method which delivers a set of (unspecified) edges which are guaranteed to form
    *  a closed sequence, that is one which is starting and ending at a wrap count of 0.
    */
+  // [[ZH-BEGIN]]
+  // 功能：投递一条**穿过**当前扫描线的边（该边的两个端点都不在本扫描线上）。
+  //
+  // ★ 与 put() 的区别：put() 投递"在此处开始/结束"的边（顶点事件），
+  //   crossing_edge() 投递"横跨此处"的边（跨越事件）。
+  //   对于"收集所有结果边"的简单 sink（如 EdgeContainer），两者往往做同样的收集动作。
+  //
+  // 注意：与 skip_n() 的关系 —— 另有一批"穿过的边"可能**不会**逐条投递，
+  //       而是通过 skip_n(n) 一次性告知"这里跳过了 n 条边"。
+  //       这批被跳过的边保证构成**闭合序列**（即环绕数从 0 出发回到 0），
+  //       因此对"结果只取决于环绕数是否变化"的评估器来说，它们不影响输出，可以整段跳过。
+  // [[ZH-END]]
   virtual void crossing_edge (const db::Edge &) { }
 
   /**
@@ -112,21 +237,42 @@ public:
    *
    *  See description of "crossing_edge" for details.
    */
+  // [[ZH-BEGIN]]
+  // 功能：告知"sink 可整体跳过 n 条边"—— 纯性能优化通道。
+  //
+  // 参数：n 被跳过的边数（这些边不逐条投递）。
+  // 前提：这 n 条边保证构成**闭合序列**（wrap count 从 0 开始、回到 0），
+  //       因此它们不会改变任何基于环绕数的评估结果，可以被安全忽略。
+  //
+  // 为什么需要它：在 redo()/重复处理时，大量边段的结果完全相同，
+  //   逐条投递会产生可观的调用开销；用 skip_n 直接跳到下一处"状态有变化"的位置。
+  //   实现见 dbEdgeProcessor.cc 中的 EdgeProcessorStates::SkipInfo。
+  //
+  // 坑：默认实现是**空操作**，即默认忽略这条优化。
+  //     若你的 sink 需要看到每一条结果边（而不只是"结果集合"），
+  //     收到 skip_n 就意味着你**拿不到**那些边的具体几何 —— 需要重新设计思路
+  //     （例如改用不触发 skip 的处理路径，或让评估器 selects_edges() 为真）。
+  // [[ZH-END]]
   virtual void skip_n (size_t /*n*/) { }
 
   /**
    *  @brief Signal the start of a scanline at the given y coordinate
    */
+  // [[ZH]] 功能：即将开始处理 y 这条扫描线。参数 y 是当前扫描线的 y 坐标。
+  // [[ZH]] 用途：需要按扫描线分批组织输出的 sink（如多边形缝合器）在此重置行状态。
   virtual void begin_scanline (db::Coord /*y*/) { }
 
   /**
    *  @brief Signal the end of a scanline at the given y coordinate
    */
+  // [[ZH]] 功能：y 这条扫描线处理完毕。与 begin_scanline 配对。
   virtual void end_scanline (db::Coord /*y*/) { }
 
   /**
    *  @brief Gets a value indicating that the generator wants to stop
    */
+  // [[ZH]] 功能：查询"是否已请求停止"。引擎在每个扫描线边界检查此标志（见 .cc 的阶段 4 循环）。
+  // [[ZH]] 用途：算法上只需部分结果的场景（例如"找到第一个满足条件的目标就够"）可提前收工。
   bool can_stop () const
   {
     return m_can_stop;
@@ -135,6 +281,8 @@ public:
   /**
    *  @brief Resets the stop request
    */
+  // [[ZH]] 功能：清除停止请求，让引擎可以继续。
+  // [[ZH]] 谁会调用：引擎在开始新一轮处理前会调用它（避免上一次的请求残留影响下一次）。
   void reset_stop ()
   {
     m_can_stop = false;
@@ -148,12 +296,35 @@ protected:
    *  This is useful for implementing receivers that can stop once a
    *  specific condition is found.
    */
+  // [[ZH-BEGIN]]
+  // 功能：由 sink 主动发起"请停止处理"的请求（protected，只能从子类内部调用）。
+  //
+  // ★ 停止协议的重要限制（新手最容易误判的地方，务必读完）：
+  //   1) 引擎**只在每个扫描线的边界**检查该标志（dbEdgeProcessor.cc 的阶段 4 循环条件）。
+  //      因此调用 request_stop() 后，**当前扫描线内剩余的边仍会继续投递**，
+  //      直到本行结束才真正停下。
+  //   2) 阶段 2（求交点）与阶段 3（打断边）**完全不响应**停止请求 ——
+  //      它们必须跑完。若你的输入很大，这两阶段的耗时无法通过停止请求规避。
+  //   3) 引擎在新一轮处理前会调用 reset_stop()，所以请求不是粘性的。
+  //
+  // 全代码库中唯一实际调用本函数的地方是 dbEdgesUtils.cc 里的 DetectTagEdgeSink
+  // （用于"找到带标签的边就停"）。
+  //
+  // 典型用法：
+  //     void my_sink::put (const db::Edge &e) override {
+  //       if (找到符合条件的结果) {
+  //         request_stop ();   // 请求停止；当前扫描线跑完后引擎会退出
+  //       }
+  //     }
+  // [[ZH-END]]
   void request_stop ()
   {
     m_can_stop = true;
   }
 
 private:
+  // [[ZH]] m_can_stop：是否已请求停止。唯一的状态成员。生命周期：reset_stop() 清零，
+  // [[ZH]] request_stop() 置位，引擎在扫描线边界读取。见上面停止协议的说明。
   bool m_can_stop;
 };
 
@@ -255,21 +426,134 @@ private:
  *  evaluator into a defined state. Each edge has an integer property that can be
  *  used to distinguish edges from different polygons or layers.
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  EdgeEvaluatorBase —— 评估器基类（"每段边如何决定去留"的协议定义）
+// ============================================================================
+//
+// 【角色】
+//   EdgeProcessor 在扫描过程中，每遇到一段边就问评估器一个问题：
+//       "这条边要不要算作结果的一部分？"
+//   评估器的回答决定了该段边被投递给 sink 还是被丢弃。
+//   不同子类给出不同回答，从而实现 merge / boolean / size / interaction 等各种操作：
+//       SimpleMerge / GenericMerge / MergeOp  → 按环绕数决定
+//       BooleanOp / BooleanOp2                → 按 A、B 两操作数的环绕数组合决定
+//       EdgePolygonOp                         → 按边与多边形的关系决定
+//       InteractionDetector                   → 不输出边，只记录多边形间的相互作用
+//
+// 【★ 最重要的机制：edge() 的返回值是"累加"的，不是布尔值 ★】
+//   引擎并不会把 edge() 的返回值当成 true/false，而是把它**累加**到
+//   每个扫描线每一侧（north/south）的计数器上。精确地说（见 dbEdgeProcessor.cc）：
+//         void north_edge (bool prefer_touch, property_type prop)
+//         { m_pn += mp_op->edge (true, prefer_touch, prop); }
+//   然后：
+//         · 若累加器 m_pn == 0 → 该位置没有边界 → 不输出边
+//         · 若 m_pn != 0      → 输出一条边，且**其符号决定输出边的方向**
+//           （源码中：m_pn > 0 且 dy < 0，或 m_pn < 0 且 dy > 0，则交换端点）
+//   所以返回值遵循这样的约定：
+//          +1  这一段是"进入结果内部"的边界（逆着某方向）
+//          -1  这一段是"离开结果内部"的边界（顺着反方向）
+//           0  与结果无关，丢弃
+//   这就是为什么各子类（如 GenericMerge）返回的是 1 / -1 / 0 而非 bool。
+//   理解这一点，才能看懂各评估器的实现为何都在算"状态迁移"。
+//
+// 【★ 一个极易踩的坑：enter 参数与 prefer_touch 是同一个值 ★】
+//   看上面 north_edge 的签名：第二个形参名叫 prefer_touch，却被直接传给了
+//   EdgeEvaluatorBase::edge() 的 **enter** 形参。两个名字不同，但**运行时是同一个数**：
+//         mp_op->edge (true, prefer_touch, prop)
+//                              ^^^^^^^^^^^^ 就是 enter
+//   之所以能成立，是因为引擎在投递前已按 prefer_touch() 对同位置的重合边分组，
+//   保证"enter == prefer_touch"这一关系成立（见 .cc 中阶段 4 的重合边循环）。
+//   读代码时若把 prefer_touch 和 enter 当成两件事，就会看不懂。
+//
+// 【与本类其余方法的关系】
+//     reset()          每条扫描线开始时调用，把评估器恢复到确定状态
+//     reserve(n)       预分配，避免处理中反复分配内存
+//     edge(...)        ★ 核心，见上
+//     select_edge(...) 可选通道：按"标签"直接挑选边投递（见下）
+//     compare_ns()     比较"扫描线上方 vs 下方"的内外状态，用于给引擎合成的
+//                      水平边定方向（见 dbEdgeProcessor.cc 的 end_vertex）
+//     is_reset()       状态是否已回到初始 —— 引擎据此识别"整段无变化"区间，
+//                      配合 skip_n() 做优化
+//     prefer_touch()   是否把"相切/重合"视为内部（会影响 enter 的取值）
+//     selects_edges()  是否启用 select_edge 通道
+//
+// 【默认实现全部是"空操作 / 返回 0/false"】
+//   因此子类只需重写自己关心的少数几个方法。
+// [[ZH-END]]
 class DB_PUBLIC EdgeEvaluatorBase
 {
 public:
+  // [[ZH]] property_type = size_t，是边上附带的"来源标签"类型（见文件头对 property 的说明）。
   typedef size_t property_type;
 
   EdgeEvaluatorBase () { }
   virtual ~EdgeEvaluatorBase () { }
 
+  // [[ZH]] 功能：把评估器恢复到确定的初始状态（清空各环绕数计数）。
+  // [[ZH]] 调用时机：每条扫描线开始时由引擎调用（见 EdgeProcessorState::reset）。
   virtual void reset () { }
+  // [[ZH]] 功能：预分配内部容器，避免处理过程中反复分配。
+  // [[ZH]] 参数：预期要处理的边数（仅作提示，实现可忽略）。
   virtual void reserve (size_t /*n*/) { }
+  // [[ZH-BEGIN]]
+  // 功能：★ 核心回调。引擎就"当前这段边"征询评估器。
+  //
+  // 参数：north  true = 更新扫描线**上方**的状态；false = 下方。
+  //               （一次扫描线事件通常上下各问一次，用于比较两侧）
+  //       enter  是否"增加"环绕数：true → +1，false → -1。
+  //              典型实现是 `*wcv += (enter ? 1 : -1);`
+  //              注意：引擎传入的实参是 prefer_touch()（见文件头"易踩的坑"）。
+  //       p      该边的 property（来源标签），用于区分不同输入的多边形/图层。
+  //
+  // 返回：★ 不是布尔值！而是"对输出边方向的贡献"，会被引擎**累加**：
+  //         +1 / -1  表示该段构成结果边界，符号决定输出边方向
+  //          0       表示与结果无关（该段会被丢弃）
+  //       详见文件头"最重要的机制"一节。
+  //
+  // 实现约定：返回值应当是"状态迁移量"，即比较调用前后的 inside/outside 状态：
+  //       由外变内 → +1；由内变外 → -1；状态未变 → 0。
+  // [[ZH-END]]
   virtual int edge (bool /*north*/, bool /*enter*/, property_type /*p*/) { return 0; }
+  // [[ZH-BEGIN]]
+  // 功能：可选的"按标签选边"通道 —— 让评估器直接指定哪条边要投递给 sink。
+  //
+  // 参数：horizontal 被询问的边是否水平（dy() == 0）；
+  //       p          该边的 property。
+  // 返回：tag > 0  → 引擎会调用 sink->put(edge, tag) 把这条边投递出去（tag 原样传递）；
+  //       tag <= 0 → 该边不走这条通道。
+  //
+  // 何时被调用：仅当 selects_edges() 返回 true 时才启用本通道，
+  //             且只对"edge_ymin == 当前扫描线 y"的边调用（见 .cc）。
+  // 用途：EdgePolygonOp 用它实现"挑出位于多边形内部的边"，并用 tag 区分内部/外部。
+  // [[ZH-END]]
   virtual int select_edge (bool /*horizontal*/, property_type /*p*/) { return 0; }
+  // [[ZH-BEGIN]]
+  // 功能：比较"扫描线上方"与"扫描线下方"的内外状态之差：
+  //           返回 result(north) - result(south)
+  //       即：站在当前 x 位置，往正上方看是否在结果内部、往正下方看是否在结果内部，二者之差。
+  //
+  // 返回：+1 = 上方在内、下方在外；-1 = 下方在内、上方在外；0 = 两侧一致。
+  //
+  // ★ 谁在用、为什么需要它：引擎在扫描线事件处理中需要**合成水平边**
+  //   （因为扫描线算法天然产生水平方向的边界段）。合成时要知道这条水平边界
+  //   应当朝哪个方向 —— 而"方向"正是由本函数的返回值决定的：
+  //       若 compare_ns() > 0，则把合成出的水平边交换端点（翻转方向）。
+  //   见 dbEdgeProcessor.cc 中 EdgeProcessorState::end_vertex 的 `m_ho = mp_op->compare_ns ()`。
+  //
+  // 注意：函数名里的 ns = north/south。
+  // [[ZH-END]]
   virtual int compare_ns () const { return 0; }
+  // [[ZH]] 功能：当前状态是否已回到初始（即所有环绕数归零）。
+  // [[ZH]] 用途：引擎用它识别"这一段处理不会产生任何变化"的区间，从而走 skip_n 优化路径，
+  // [[ZH]]       跳过整段边而不逐条处理。见 dbEdgeProcessor.cc 的 SkipInfo。
   virtual bool is_reset () const { return false; }
+  // [[ZH]] 功能：询问评估器"相切/重合(touching)是否算作内部"。
+  // [[ZH]] 为什么重要：引擎把这个返回值当作 edge() 的 enter 实参传下去（见文件头的坑）。
+  // [[ZH]]              所以它会直接影响环绕数的加减方向。
   virtual bool prefer_touch () const { return false; }
+  // [[ZH]] 功能：是否启用 select_edge() 通道。
+  // [[ZH]] 返回 true 时，引擎会逐条对"起始于本扫描线"的边调用 select_edge()。
   virtual bool selects_edges () const { return false; }
 };
 
