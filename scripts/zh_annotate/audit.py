@@ -344,24 +344,33 @@ def setup_include_paths(root):
             INC += ["-I", p]
 
 
-def _normalise_preprocessed(text, paths):
+def _normalise_preprocessed(text, root):
     """Normalise the metadata that MUST differ between pristine and annotated.
 
     归一化「必然不同」的元数据。
 
-    Comments change line numbers, so `__LINE__` (and therefore the file/line
-    strings baked into tl_assert) cannot stay identical -- any change that adds
-    lines has this effect, and it is harmless.  `__FILE__` differs too because we
-    preprocess the pristine copy from a temporary path.  Both are normalised away
-    so that a REAL semantic difference is what remains visible.
+    Comments change line numbers, so `__LINE__` (and the file/line strings baked
+    into tl_assert) cannot stay identical -- any change that adds lines has this
+    effect, and it is harmless.  `__FILE__` can also differ in FORM (absolute vs
+    relative) depending on how the translation unit was named.
+    Both are normalised away so that a real semantic difference stays visible.
 
     注释会改变行号，因此 `__LINE__`（以及 tl_assert 里固化的文件/行号字符串）
-    不可能保持一致 —— 任何增加行数的改动都如此，且无害。`__FILE__` 也会不同，
-    因为原始副本是从临时路径预处理的。把两者归一化掉，剩下的才是真正的语义差异。
+    不可能保持一致 —— 任何增加行数的改动都如此，且无害。`__FILE__` 的**形式**
+    （绝对/相对）也可能不同。把两者归一化掉，剩下的才是真正的语义差异。
+
+    Implemented in three ordered, order-INDEPENDENT steps.  An earlier version
+    substituted a list of path spellings in sequence, which broke when a relative
+    spelling was a substring of the absolute one: the short form matched first,
+    leaving a prefix behind and defeating the line-number pattern too.
+    分三步实现，且与替换顺序无关。早期版本按顺序替换一组路径写法，当相对写法是
+    绝对写法的子串时会失效：短形式先命中，留下前缀，连行号匹配也一并失效。
     """
-    for p in paths:
-        text = text.replace(p, "<FILE>")
-    # assertion_failed ("<FILE>", 123, "...")  ->  collapse the line number
+    # 1) make absolute paths relative, so both sides use one spelling
+    text = text.replace(root.rstrip("/") + "/", "")
+    # 2) any file reference inside an assertion -> <FILE>
+    text = re.sub(r'(assertion_failed\s*\(\s*)"[^"]*"', r'\1"<FILE>"', text)
+    # 3) any line number inside an assertion -> <LINE>
     text = re.sub(r'(assertion_failed\s*\(\s*"<FILE>"\s*,\s*)\d+', r"\1<LINE>", text)
     return text
 
@@ -386,10 +395,8 @@ def check_preprocessor(root, ref, files, quick):
         if a.returncode != 0 or b.returncode != 0:
             fails.append("%s (preprocess error)" % rel)
             continue
-        ta = _normalise_preprocessed(a.stdout.decode("utf-8", "replace"),
-                                     [pristine, rel, path])
-        tb = _normalise_preprocessed(b.stdout.decode("utf-8", "replace"),
-                                     [pristine, rel, path])
+        ta = _normalise_preprocessed(a.stdout.decode("utf-8", "replace"), root)
+        tb = _normalise_preprocessed(b.stdout.decode("utf-8", "replace"), root)
         if ta != tb:
             fails.append("%s (real difference beyond __FILE__/__LINE__)" % rel)
             # Show the first differing line to make the failure actionable.

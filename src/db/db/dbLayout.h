@@ -444,6 +444,61 @@ struct DB_PUBLIC LayoutOrCellContextInfo
  *  The layout object basically wraps the cell graphs and
  *  adds functionality for managing cell names and layer names.
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  db::Layout —— ★ 整个数据库对象（使用本库的入口）
+// ============================================================================
+//
+// 【它是什么】
+//   一个 Layout 就是**一个版图文件的内容**（一个 GDS/OASIS 文件对应一个 Layout）。
+//   上面英文注释的“wraps the cell graphs”指的是：它拥有全部 cell 以及它们之间的
+//   层次引用关系；在此之上再管理 **cell 名** 与 **层名(layer names)**。
+//   换句话说：Layout 是“容器 + 命名表 + 单位/属性等全局信息”的集合。
+//
+// 【★★ 层次结构（这是理解整个 db 模块的主干，务必记住）】
+//     db::Layout                      ← 你在这里（整个数据库）
+//       ├─ 单元表：Cell 0, Cell 1, ...（按 cell_index 索引）
+//       │    └─ db::Cell              ← 一个单元
+//       │         ├─ 多层图形：db::Shapes（每层一个）
+//       │         │    └─ db::Shape   ← 单个图形的句柄
+//       │         └─ 实例列表：db::Instance → 指向另一个 Cell（形成层次图）
+//       ├─ 层定义：layer properties（层号 + 数据类型 + 名字）
+//       └─ 全局：数据库单位 dbu、属性仓库、PCell 注册表、管理/事务状态
+//   ★ “cell graph”就是由 Instance 连接起来的图；Layout 是这张图的所有者。
+//
+// 【★ 使用 Layout 的典型流程（面向写脚本/写工具的人）】
+//     1) 读入：用 db::Reader（或具体的 GDS2/OASIS 插件）把文件读成 Layout；
+//     2) 拿单位：layout.dbu() —— DBU/微米的比例，所有坐标换算都靠它；
+//     3) 找单元：按名字（cell_by_name）或按索引（cell 遍历）；
+//     4) 找层：  按名字/层号查 layer index，再取该层的 Shapes；
+//     5) 处理：  遍历 Shape 或用 db::Region 做几何运算；
+//     6) 修改时：**必须先 start_changes() 后 end_changes()**（见下）；
+//     7) 写出：  用 db::Writer 保存。
+//
+// 【★★ 改动版图必须遵守的事务协议 —— 最容易被忽略的一点】
+//   Layout 继承自 db::LayoutStateModel，因此有“状态”概念。修改内容的正确姿势：
+//       layout.start_changes ();     // 声明“我要改了”
+//       ... 修改 cell / shapes / instances ...
+//       layout.end_changes ();       // 声明“改完了”
+//   为什么必须：库需要知道何时可以假设“数据未被修改”，据此缓存/复用
+//   （例如层次包围盒、Region 的展开结果）。跳过这对调用会导致
+//   **缓存与数据不一致** —— 表现为“改了但没生效”或“结果莫名不对”。
+//   ★ 补充：若用 db::Manager（undo 系统）配合，事务边界还会与 undo 记录对应。
+//
+// 【继承了什么（决定了 Layout 的附加能力）】
+//   db::Object           → 参与库的统一对象/属性体系
+//   db::LayoutStateModel → 状态与“修改中”标记（上面事务协议的基础）
+//   以及其它接口（层管理、属性、meta info、library proxy 等）
+//
+// 【常见坑速查】
+//   · dbu 是 1 微米对应的 DBU 数，**不是** DBU 本身；换算见 Layout::dbu() 说明。
+//   · 层是用 layer index 引用，不是层号 —— 先“按层号/名查 index”，再用 index。
+//   · 不要跨 start/end_changes 保存 db::Shape（句柄可能失效，见 dbShape.h）。
+//   · 删除/新增 cell 会使 cell index 变化，长期保存 index 需谨慎。
+//
+// 【本文件其它内容】LayoutLocker（RAII 风格的自动 start/end_changes 包装）、
+//   layer 与 cell 的增删查改接口、单位与属性管理。
+// [[ZH-END]]
 
 class DB_PUBLIC Layout 
   : public db::Object,
