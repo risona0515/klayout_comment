@@ -543,10 +543,112 @@ def cmd_stats(paths):
     return 0
 
 
+def cmd_autofix(paths):
+    """Implement the `autofix` subcommand.
+
+    实现 `autofix` 子命令。
+
+    Removes the stray blank lines that are the single most common mistake when
+    inserting an annotation block by hand -- a blank line added just before
+    [[ZH-BEGIN]] or just after [[ZH-END]] where the original had none.  Those
+    lines carry no marker, so stripping leaves them behind and byte-exactness
+    breaks.
+
+    移除手工插入注释块时最常见的多余空行 —— 在原文没有空行的地方，
+    于 [[ZH-BEGIN]] 之前或 [[ZH-END]] 之后多加的空行。这类行不带标记，
+    因此剥离后会残留，破坏逐字节还原。
+
+    The fix is *verified*: a candidate edit is kept only if it makes `verify`
+    pass.  That makes it safe to run on a file without understanding the exact
+    mismatch -- if no candidate helps, nothing is written.
+
+    修复是**经过校验的**：只有让 `verify` 通过的候选改动才会被保留。
+    因此在不必看懂具体差异的情况下也可以安全运行 —— 若无候选有效，则不写入。
+    """
+    root = repo_root()
+    ref = base_ref(root)
+    for path in paths:
+        if not os.path.isfile(path):
+            print("FAIL  %s: no such file" % path)
+            continue
+
+        # Already fine?  If verify passes there is nothing to do.
+        try:
+            verify(path, root, ref)
+            print("ok    %s (already verified, unchanged)" % path)
+            continue
+        except CheckFailure:
+            pass
+
+        original = read_lines(path)
+        fixed = _try_blank_line_fixes(path, original, root, ref)
+        if fixed is None:
+            print("HINT  %s: verify fails, but no blank-line fix applies -- "
+                  "inspect manually / 校验失败，但空行修复不适用，请手工检查"
+                  % path)
+            continue
+
+        with open(path, "w", encoding=ENCODING, newline="") as fp:
+            fp.write("".join(fixed))
+        n_marked, n_blocks, n_added = verify(path, root, ref)
+        print("FIXED %s (%d ann.lines, %d blocks, %+d lines)"
+              % (path, n_marked, n_blocks, n_added))
+    return 0
+
+
+def _try_blank_line_fixes(path, lines, root, ref):
+    """Try candidate blank-line removals, returning the first that verifies.
+
+    尝试若干“删除空行”的候选改动，返回第一个能通过校验的结果。
+
+    Candidates considered / 候选策略：
+      1. drop a blank line immediately after  [[ZH-END]]
+      2. drop a blank line immediately before [[ZH-BEGIN]]
+      3. drop blank lines in BOTH positions
+    Returns None if none of them makes verify pass.
+    若都无效则返回 None。
+    """
+    n = len(lines)
+
+    def is_blank(i):
+        return 0 <= i < n and lines[i].strip() == ""
+
+    def is_end(i):
+        return 0 <= i < n and lines[i].strip().startswith("//") and BLOCK_END in lines[i]
+
+    def is_begin(i):
+        return 0 <= i < n and lines[i].strip().startswith("//") and BLOCK_BEGIN in lines[i]
+
+    # Collect the indices to drop for each strategy.
+    # 收集每种策略要删除的下标。
+    after_end = {i + 1 for i in range(n) if is_end(i) and is_blank(i + 1)}
+    before_begin = {i - 1 for i in range(n) if is_begin(i) and is_blank(i - 1)}
+
+    candidates = [sorted(after_end), sorted(before_begin),
+                  sorted(after_end | before_begin)]
+
+    for drop in candidates:
+        if not drop:
+            continue
+        kept = [ln for i, ln in enumerate(lines) if i not in set(drop)]
+        tmp = path + ".zhfix"
+        with open(tmp, "w", encoding=ENCODING, newline="") as fp:
+            fp.write("".join(kept))
+        try:
+            verify(tmp, root, ref)
+        except CheckFailure:
+            os.unlink(tmp)
+            continue
+        os.unlink(tmp)
+        return kept
+    return None
+
+
 COMMANDS = {
     "verify": cmd_verify,
     "strip": cmd_strip,
     "stats": cmd_stats,
+    "autofix": cmd_autofix,
 }
 
 
@@ -554,12 +656,14 @@ def main(argv):
     """Entry point. / 程序入口。"""
     if len(argv) < 3 or argv[1] not in COMMANDS:
         sys.stderr.write(
-            "usage: %s {verify|strip|stats} <file> [<file> ...]\n" % argv[0]
+            "usage: %s {verify|strip|stats|autofix} <file> [<file> ...]\n" % argv[0]
         )
         sys.stderr.write(
-            "       verify -- prove that annotations are purely additive\n"
-            "       strip  -- remove all [[ZH]] annotation lines in place\n"
-            "       stats  -- report annotation counts per file\n"
+            "       verify  -- prove that annotations are purely additive\n"
+            "       strip   -- remove all [[ZH]] annotation lines in place\n"
+            "       stats   -- report annotation counts per file\n"
+            "       autofix -- remove stray blank lines beside marker blocks,\n"
+            "                  keeping the change only if verify then passes\n"
         )
         return 2
     return COMMANDS[argv[1]](argv[2:])

@@ -46,6 +46,41 @@ class Layout;
  *  A library must provide a layout. This class does not specify how the layout 
  *  is provided. To do so, this class must be reimplemented.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **库（library）** —— 对 Layout 的包装，并额外带上 id / 名字 / 描述。
+//
+// 【它解决什么问题（为什么不能直接用 Layout）】
+//   一个 KLayout 会话里可能同时打开**很多个版图文件**，还有内置库、
+//   技术库等。光有 Layout 不够，因为：
+//     · 需要一个**稳定标识**（id）来引用它；
+//     · 需要**名字与描述**用于界面显示与检索；
+//     · 需要支持“**惰性加载/重新加载**”（库可能很大，不必立刻读进来）；
+//     · 需要允许“库”的**内容来源**各不相同（文件 / 内存 / 数据库 / 远程...）。
+//   本类因此把"“提供 Layout”这一动作抽象成**虚函数**，由子类实现。
+//
+// 【★★ 核心设计：它是抽象基类，必须被继承】
+//   上面英文注释明确写着：
+//     “A library must provide a layout. This class does not specify how the
+//      layout is provided. To do so, this class must be reimplemented.”
+//   ★ 即：本类**不能直接拿来用** —— 它只规定“库应该能提供 Layout”这个契约。
+//     具体怎么提供（从文件读？从内存构造？）由派生类决定。
+//   典型派生类：db::LayoutLibrary（直接持有 Layout，最常用）、
+//               以及从文件惰性加载的实现（见 dbLibraryManager / dbLibraryProxy）。
+//
+// 【★ 继承两个基类各为什么】
+//     gsi::ObjectBase —— 让它能被脚本（Ruby/Python）当作对象使用；
+//     tl::Object      —— 让它能参与**共享/弱指针**的引用计数管理
+//                        （见 tlObject.h：含 keep_object / release_object）。
+//   ★ 后者尤其重要：库可能被很多地方引用，且需要“在使用中不被销毁”，
+//     引用计数正是为此。
+//
+// 【与 db::LibraryManager 的关系】
+//   由 LibraryManager 统一登记与管理所有 Library（按 id / 名字索引）。
+//   本类负责“一个库是什么”，Manager 负责“有哪些库”。
+//
+// 【本文件其余内容】
+//   LayoutLibrary —— 直接持有一个 Layout 的具体实现（最常用）。
+// [[ZH-END]]
 class DB_PUBLIC Library
   : public gsi::ObjectBase, public tl::Object
 {

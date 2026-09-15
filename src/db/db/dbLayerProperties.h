@@ -44,6 +44,40 @@ namespace db
  *  In this case, the layer properties can make use of the relative
  *  layer/datatype specifications.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **层的标识与名称** —— “这一层是什么”（层号/数据类型/名字）的载体。
+//
+// 【它解决什么问题】
+//   版图里一层由 GDS 的 (layer, datatype) 这一对整数标识；
+//   但人需要读得懂的名字（如 "M1"、"poly"）。
+//   LayerProperties 就是把这两者绑在一起的类型：
+//       layer       —— 层号（整数，GDS 的 layer）
+//       datatype    —— 数据类型（整数，GDS 的 datatype）
+//       name        —— 人类可读的名字（可为空）
+//       (还可能带一个 layer offset，见下面 LayerOffset)
+//   ★ 注意：它**只是描述**，不含图形本身 —— 内容在 db::Shapes 里（见 dbShapes.h）。
+//
+// 【★★ 一个关键概念：相对层规格（relative specifications）—— 容易忽略】
+//   上面英文注释特别点出了“目标(target)用途”下的相对规格。
+//   含义：在**层映射 (layer mapping)** 场景中，目标层可以写成
+//       “相对于源层偏移 +1”这种形式（如 `*+1`），而不是绝对层号。
+//   ★ 为什么需要：写 DRC/LVS 的层映射规则时，希望“所有层的目标层都等于源层+1”，
+//     而不必逐层硬编码。
+//   实用影响：解析字符串时可能需要 `as_target = true` 才允许相对写法，
+//     因此“同一字符串按源解析与按目标解析可能不同”。
+//
+// 【与 db::Layout 的关系】
+//   Layout 持有一张层表（layer → LayerProperties）。
+//   ★ 重要：**图形是用 layer index 索引的，不是用层号**。
+//     所以典型流程是：用层号/层名查出 layer index，再用 index 取该层的 Shapes。
+//     （见 dbLayout.h 的说明与 dbShapes.h 的说明。）
+//
+// 【本文件其余内容】
+//   LayerPropertiesLessThan          —— 用于排序/作为 map 键的“逻辑比较”
+//   LayerOffset                      —— 层的偏移量（用于层映射时做整体平移）
+//   LayerPropertiesWithOffset        —— 把 LayerProperties 与偏移组合起来
+//   末尾的 extractor 特化              —— 注册文本解析（同 dbPoint.cc 的模式）
+// [[ZH-END]]
 struct DB_PUBLIC LayerProperties
 {
   /**
