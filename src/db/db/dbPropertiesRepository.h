@@ -85,6 +85,41 @@ struct ComparePropertiesIds
  *
  *  The properties set is
  */
+// [[ZH-BEGIN]]
+// 功能：★ **一组属性（键值对集合）** —— 版图对象上附加的“元数据”。
+//
+// 【它解决什么问题】
+//   版图里的图形/实例/单元可以携带用户定义的信息，例如：
+//       net = "VDD"、layer_name = "M1"、drc_violation = true ...
+//   这些不是几何，但不存又不行（LVS/DRC/自定义工具都要用）。
+//
+// 【★★ 核心设计：属性不直接存在对象里，而是“存进仓库、对象只拿 ID”】
+//   看上面英文注释（PropertiesRepository 处）说明的机制：
+//     一对 (名字, 值)  → 仓库分配一个唯一 ID → 对象里只存这个 ID。
+//   这样做的好处：
+//     · 对象变小：不用在每个图形里塞字符串（图中可能有上亿图形）；
+//     · 去重：相同属性组合共享同一个 ID，不重复存储；
+//     · 可比较：比较两个对象属性是否相同 → 只需比较整数 ID。
+//   ★ 代价：要读属性必须能访问到**仓库**（而仓库通常是全局单例）。
+//
+// 【★ 名字用整数而不是字符串（性能细节）】
+//   英文注释明确说了原因：“For performance reasons property names (which are
+//   strings) are not stored as such but as integers.”
+//   因为名字会反复出现（如每个图形都有 "net"），比较字符串远慢于比整数。
+//   因此名字先过一次 **intern**（驻留/规范化），转成 property_names_id_type。
+//
+// 【存储结构】如上 typedef：一个 **multimap<名字ID, 值ID>**。
+//   ★ 是 multimap 而不是 map —— 因此**同名属性可以有多个值**
+//     （例如一个路径有多个 owner，或一个图形属于多个 net）。
+//     这是容易被忽略的一点：不要假设属性名唯一。
+//
+// 【本类型在库中的位置】
+//   • 作为 db::ObjectWithProperties 的“属性部分”；
+//   • 与 db::Shape / db::Instance / db::Cell 的属性支持直接相关
+//     （它们都是通过属性 ID 引用本仓库中的集合）。
+//   • db::PropertiesTranslator（本文件后面）负责在不同仓库之间“翻译”ID，
+//     用于复制图形到另一个 Layout 时迁移属性。
+// [[ZH-END]]
 
 class DB_PUBLIC PropertiesSet
 {
@@ -328,6 +363,34 @@ DB_PUBLIC db::properties_id_type properties_id (const std::map<tl::Variant, tl::
  *  For performance reasons property names (which are strings) are not
  *  stored as such but as integers.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **属性仓库** —— 全局登记 (名字, 值) 组合并发放唯一 ID 的单例。
+//
+// 【为什么需要“仓库”而不是让对象自己存字符串】
+//   上面英文注释已给出答案，展开：
+//     · 版图图形数量可达上亿，每个都存字符串会撑爆内存；
+//     · 大量对象的属性是**相同**的（如都属于同一个 net），应当去重；
+//     · 属性比较/拷贝应当廉价 → 用整数 ID 代替字符串。
+//   因此设计成：对象只存 property_id（一个整数），真数据在仓库里。
+//
+// 【★★ 它的一个关键特性：**跨 Layout 共享/不共享**】
+//   注意 instance() 返回的是**单例**。这意味着：
+//     · 同一进程内，属性是**全局共享**的（两个 Layout 的属性可能互相引用）；
+//     · 因此把一个图形从 A 库复制到 B 库时，**不能直接沿用属性 ID**，
+//       需要做迁移/翻译 —— 这就是下面 PropertiesTranslator 存在的理由。
+//   ★ 这也是“为什么不能自己构造属性 ID”的原因：
+//     自行编造的 ID 在别的上下文里可能指向不相干的属性（而且不报错）。
+//
+// 【与 db::PropertiesSet 的分工】
+//   PropertiesSet         —— 一组属性（名字ID ↔ 值ID 的 multimap），即“属性的集合”
+//   PropertiesRepository  —— 名字/值的**驻留表** + 集合的**登记表**，负责发 ID
+//   PropertiesTranslator  —— 把一套 ID 翻译成另一套（跨 Layout 迁移）
+//
+// 【常见使用误区】
+//   · 以为 property_id 可以在不同 Layout / 不同进程之间通用 —— 不可以；
+//   · 以为属性存储在图知对象内部 —— 不在；对象只存整数 ID；
+//   · 长期保存 property_id 而不持有仓库 —— 仓库生命周期需注意。
+// [[ZH-END]]
 
 class DB_PUBLIC PropertiesRepository
 {
@@ -512,6 +575,38 @@ private:
  *  but as such IDs cannot become input to the old translator, this should
  *  not matter.
  */
+// [[ZH-BEGIN]]
+// 功能：★ **属性 ID 的映射器/过滤器** —— 把一套属性 ID 翻译成另一套。
+//
+// 【为什么需要它（解决的真实问题）】
+//   属性 ID 是**按仓库分配的**（见上面 PropertiesRepository 的说明）。
+//   因此把一个图形从 A 库复制到 B 库时，**不能直接用原来的属性 ID** ——
+//   那个 ID 在 B 库的仓库里可能指向完全不相干的属性。
+//   本类就是这层"翻译"：拷贝时用它把旧 ID 换成新 ID，或不带过去。
+//
+// 【★★ 三条映射规则（上面英文注释已列出，很重要）】
+//   1) **未在映射表里出现的属性 → 映射为 0**，而 0 表示"无属性"。
+//      ★ 即：默认行为是**丢弃**未被显式列出的属性。
+//   2) 0 永远映射为 0（"无属性"保持"无属性"）。
+//   3) 传给构造函数的映射表里**不要包含 key 0 或 value 0**。
+//      （因为 0 是保留值，放进去会破坏上面两条语义。）
+//
+// 【两种"全量"特殊翻译器】
+//   · pass translator（"全通过"）—— 所有 ID 原样不动。
+//     用途：不需要过滤时（单纯为了接口统一）。
+//   · 构造时传 pass = false → "全部移除"（所有属性都变 0）。
+//
+// 【★★ 一个使用时必须知道的限制：翻译器是"快照"】
+//   英文注释特别提醒："property translators ... are snapshots."
+//   含义：翻译器在创建时就固定了映射关系。但**创建新的过滤器/映射器时，
+//   可能会为映射目标分配新的属性 ID** —— 这会让之前创建的翻译器**失效**。
+//   它给出的实用建议：
+//     · 通常**安全**的做法是把新翻译器**串在旧翻译器之后**；
+//     · 旧翻译器不会认识新翻译器产生的 ID，但这些 ID 也不会输入给旧翻译器，
+//       因此不出问题。
+//   ★ 结论：把翻译器当作"一次性、短生命周期"的对象使用，
+//     不要长期缓存并期待它一直有效。
+// [[ZH-END]]
 
 class DB_PUBLIC PropertiesTranslator
 {
