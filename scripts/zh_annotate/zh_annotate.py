@@ -277,9 +277,24 @@ def first_difference(got, want):
         g = got[i] if i < len(got) else "<missing>"
         w = want[i] if i < len(want) else "<missing>"
         if g != w:
+            # The single most common mistake is an unmarked blank line slipped
+            # in around a marker block.  Detect it and say so plainly.
+            # 最常见的错误是在标记块附近混入了未标记的空行。这里直接点明。
+            hint = ""
+            if not g.strip() or not w.strip():
+                hint = (
+                    "\n      HINT: this looks like an unmarked blank line. "
+                    "Never leave a blank line outside a "
+                    "[[ZH-BEGIN]]/[[ZH-END]] block, and never add one right "
+                    "after [[ZH-END]] -- reuse the existing blank line or put "
+                    "the separation inside the block."
+                    "\n      提示：这看起来是未标记的空行。不要在 "
+                    "[[ZH-BEGIN]]/[[ZH-END]] 块之外留空行，"
+                    "尤其不要紧跟在 [[ZH-END]] 之后加空行；"
+                    "应复用已有的空行，或把空行放进块内。")
             return ("first mismatch at stripped line %d:\n"
                     "      got : %r\n"
-                    "      want: %r" % (i + 1, g, w))
+                    "      want: %r%s" % (i + 1, g, w, hint))
     return "no difference found / 未发现差异"
 
 
