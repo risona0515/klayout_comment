@@ -82,6 +82,46 @@ END_RE = re.compile(r"^[ \t]*//[ \t]*\[\[ZH-END\]\][ \t]*$")
 # 本次注释的文件含中文，因此必须是合法 UTF-8。
 ENCODING = "utf-8"
 
+# Optional explicit override for the pristine base ref, e.g. ZH_BASE=v0.30.12
+# 可选的显式基准 ref 覆盖，例如 ZH_BASE=v0.30.12
+ENV_BASE_REF = os.environ.get("ZH_BASE", "").strip()
+
+# Candidate names for the upstream branch we branched off from.
+# 我们从中分叉出来的上游分支的候选名字。
+UPSTREAM_CANDIDATES = ("master", "main", "origin/master", "origin/main")
+
+
+def base_ref(root):
+    """Resolve the pristine base ref used for comparison.
+
+    解析用于比对的「原始基准」ref。
+
+    WHY NOT HEAD: we commit our own annotations as we go, so HEAD moves and
+    eventually contains the annotations themselves.  Comparing against HEAD
+    would then demand that stripping remove *fewer* lines than we added.
+    The correct baseline is the commit the annotation branch started from --
+    i.e. the merge base with the upstream branch.
+
+    为什么不直接用 HEAD：我们会不断提交自己的注释，HEAD 会随之前移并最终包含
+    注释本身。此时以 HEAD 为基准会要求"剥离掉的行数少于实际新增"，判断必然失败。
+    正确的基准是注释分支的起点，即与上游分支的 merge base。
+
+    Resolution order / 解析顺序:
+      1. $ZH_BASE if set                  / 若设置了 $ZH_BASE
+      2. merge-base(HEAD, upstream)       / 与上游分支的合并基点
+      3. HEAD (degenerate fallback)       / 退化回退到 HEAD
+    """
+    if ENV_BASE_REF:
+        return ENV_BASE_REF
+    for candidate in UPSTREAM_CANDIDATES:
+        r = subprocess.run(
+            ["git", "merge-base", "HEAD", candidate],
+            capture_output=True, text=True, cwd=root,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return "HEAD"
+
 
 class CheckFailure(Exception):
     """Raised when a verification check fails. / 校验失败时抛出。"""
@@ -178,35 +218,25 @@ def strip_annotations(mask, lines):
     return [ln for ln, drop in zip(lines, mask) if not drop]
 
 
-def pristine_lines(path):
-    """Fetch the pristine version of `path` from git.
+def pristine_lines(root, relpath, ref):
+    """Fetch the pristine version of a file from git.
 
-    从 git 中取出 `path` 的原始版本（HEAD 版本）。
+    从 git 中取出某个文件的原始版本。
 
-    Raises CheckFailure if the file is untracked or git is unavailable.
-    若文件未被 git 跟踪或 git 不可用则抛出 CheckFailure。
+    `ref` is the base ref resolved by base_ref() (the annotation branch point),
+    not HEAD.  `ref` 是由 base_ref() 解析出的基准 ref（注释分支的起点），不是 HEAD。
+
+    Raises CheckFailure if the file is untracked at `ref`.
+    若文件在该 ref 上未被跟踪则抛出 CheckFailure。
     """
-    repo_root = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True,
-    )
-    if repo_root.returncode != 0:
-        raise CheckFailure("not inside a git repository / 不在 git 仓库内")
-
-    root = repo_root.stdout.strip()
-    abspath = os.path.abspath(path)
-    if not abspath.startswith(root + os.sep):
-        raise CheckFailure("%s: outside the repository / 不在仓库内" % path)
-
-    relpath = os.path.relpath(abspath, root)
     show = subprocess.run(
-        ["git", "show", "HEAD:%s" % relpath],
+        ["git", "show", "%s:%s" % (ref, relpath)],
         capture_output=True, cwd=root,
     )
     if show.returncode != 0:
         raise CheckFailure(
-            "%s: not tracked by git at HEAD / 未被 git 跟踪: %s"
-            % (path, show.stderr.decode("utf-8", "replace").strip())
+            "%s: not tracked by git at %s / 在该基准 ref 上未被跟踪: %s"
+            % (relpath, ref, show.stderr.decode("utf-8", "replace").strip())
         )
 
     try:
@@ -214,23 +244,37 @@ def pristine_lines(path):
     except UnicodeDecodeError as exc:
         raise CheckFailure(
             "%s: pristine file is not valid UTF-8 / 原始文件不是合法 UTF-8: %s"
-            % (path, exc)
+            % (relpath, exc)
         )
     return text.splitlines(keepends=True)
 
 
 def is_untracked(exc):
-    """True if the failure means 'file is new and has no HEAD version'.
+    """True if the failure means 'file is new and has no base version'.
 
-    当失败原因是「文件是新增的、HEAD 中不存在」时返回 True。
+    当失败原因是「文件是新增的、基准 ref 中不存在」时返回 True。
     """
-    return "not tracked by git at HEAD" in str(exc)
+    return "not tracked by git at" in str(exc)
 
 
-def verify(path):
-    """Verify that `path` is a purely additive annotation of its HEAD version.
+def repo_root():
+    """Return the absolute path of the repository root.
 
-    校验 `path` 相对其 HEAD 版本是「纯增量注释」。
+    返回仓库根目录的绝对路径。
+    """
+    r = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise CheckFailure("not inside a git repository / 不在 git 仓库内")
+    return r.stdout.strip()
+
+
+def verify(path, root=None, ref=None):
+    """Verify that `path` is a purely additive annotation of its base version.
+
+    校验 `path` 相对其「基准版本」是纯增量注释。
 
     Returns (annotation line count, block count, added line count).
     返回 (注释行数, 注释块数, 新增行数)。
@@ -238,16 +282,26 @@ def verify(path):
     if not os.path.isfile(path):
         raise CheckFailure("%s: no such file / 文件不存在" % path)
 
+    own_root = root is None
+    if own_root:
+        root = repo_root()
+    if ref is None:
+        ref = base_ref(root)
+
+    abspath = os.path.abspath(path)
+    if not abspath.startswith(root + os.sep):
+        raise CheckFailure("%s: outside the repository / 不在仓库内" % path)
+    relpath = os.path.relpath(abspath, root)
+
     lines = read_lines(path)
     mask, n_marked, n_blocks = build_removal_mask(path, lines)
     stripped = strip_annotations(mask, lines)
 
-    # A file that git does not track yet (e.g. a newly added one) has no
-    # pristine counterpart; in that case we only check marker well-formedness.
-    # 对于 git 尚未跟踪的新文件没有原始版本可比，此时只校验标记本身。
     try:
-        original = pristine_lines(path)
+        original = pristine_lines(root, relpath, ref)
     except CheckFailure as exc:
+        # A brand-new file has no base counterpart to compare against.
+        # 新增文件没有基准版本可比对。
         if is_untracked(exc):
             return n_marked, n_blocks, len(lines)
         raise
@@ -258,10 +312,10 @@ def verify(path):
     if stripped != original:
         detail = first_difference(stripped, original)
         raise CheckFailure(
-            "%s: stripping [[ZH]] lines does NOT reproduce HEAD "
-            "(a non-annotation line was modified, added or removed) / "
-            "剥离注释行后无法还原 HEAD 版本（说明有非注释行被修改/新增/删除）\n"
-            "    %s" % (path, detail)
+            "%s: stripping [[ZH]] lines does NOT reproduce the base version "
+            "(%s) -- a non-annotation line was modified, added or removed / "
+            "剥离注释行后无法还原基准版本（%s）—— 说明有非注释行被修改/新增/删除\n"
+            "    %s" % (path, ref, ref, detail)
         )
 
     return n_marked, n_blocks, len(lines) - len(original)
@@ -300,13 +354,24 @@ def first_difference(got, want):
 
 def cmd_verify(paths):
     """Implement the `verify` subcommand. / 实现 `verify` 子命令。"""
+    try:
+        root = repo_root()
+        ref = base_ref(root)
+    except CheckFailure as exc:
+        print("FAIL  %s" % exc)
+        return 1
+
+    print("Base ref for comparison / 比对基准: %s" % ref)
+    print("(the annotation branch point, not HEAD -- HEAD contains our "
+          "annotations)\n")
+
     ok = True
     total_annotations = 0
     total_blocks = 0
     total_added = 0
     for path in paths:
         try:
-            n_marked, n_blocks, n_added = verify(path)
+            n_marked, n_blocks, n_added = verify(path, root, ref)
         except CheckFailure as exc:
             print("FAIL  %s" % exc)
             ok = False
@@ -345,9 +410,16 @@ def cmd_strip(paths):
 
 def cmd_stats(paths):
     """Implement the `stats` subcommand. / 实现 `stats` 子命令。"""
+    try:
+        root = repo_root()
+        ref = base_ref(root)
+    except CheckFailure as exc:
+        print("FAIL  %s" % exc)
+        return 1
+
     for path in paths:
         try:
-            n_marked, n_blocks, n_added = verify(path)
+            n_marked, n_blocks, n_added = verify(path, root, ref)
         except CheckFailure as exc:
             print("FAIL  %s" % exc)
             continue

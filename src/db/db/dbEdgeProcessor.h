@@ -733,26 +733,69 @@ private:
 /**
  *  @brief A helper class to implement the SimpleMerge operator
  */
+// [[ZH-BEGIN]]
+// 功能：把整数模式 (mode) 翻译成"判断某个环绕数 wc 是否算作内部"的谓词。
+//       它是一个**函数对象**（functor），被 GenericMerge 当作模板参数 F 使用，
+//       也被 EdgePolygonOp 用来解释多边形自身的环绕数。
+//
+//       一句话：本结构体就是全库"融合模式(mode)"语义的**唯一定义处**。
+//       其他类（SimpleMerge、EdgePolygonOp、BooleanOp2）的 mode 参数含义都来自这里。
+//
+// ★ mode 语义表（wc = 环绕数 / wrap count）：
+//
+//     mode > 0  (即 mode = n):
+//         返回 wc >= n
+//         → "至少有 n 圈重叠才算内部"
+//         例：n=1 即非零环绕规则；n=2 即"至少两个多边形重叠处才算"
+//
+//     mode < 0  (即 mode = -n):
+//         返回 (wc <= -n) || (-wc <= -n)，等价于 **|wc| >= n**
+//         → 与 mode = +n 的区别是**同时接受负环绕数**
+//         为什么需要：环绕数可为负（取决于边的绕行方向）。
+//         mode = -1（默认值）表示"不论正负，只要非零就算内部"，
+//         即经典的 **非零环绕规则 (non-zero winding rule)**，最常用。
+//
+//     mode == 0:
+//         返回 wc 为奇数（对负数取绝对值后再取模）
+//         → **奇偶规则 (even-odd rule)**
+//         即"射线穿过边界的次数为奇数 ⇒ 在内部"，可以正确处理自相交图形。
+//
+// 参数：wc 待判断的环绕数（可为负）。
+// 返回：true = 该位置算作"在结果内部"。
+//
+// 坑：1) mode == 0 走的是**奇偶规则**，不是"wc >= 0"或"wc != 0" —— 容易被误读。
+//     2) mode 的正负不对称是有意设计：+n 只看正环绕数，-n 看两侧。
+//        所以 mode = 1 与 mode = -1 结果**不同**（前者只认正环绕）。
+//     3) 对负数取模的行为在 C++ 中依赖实现约定，这里用 `wc < 0 ? (-wc) % 2 : wc % 2`
+//        显式处理了符号，保证负数也得到正确的奇偶性。
+// [[ZH-END]]
 struct ParametrizedInsideFunc 
 {
+  // [[ZH]] 功能：用给定的整数模式构造谓词。mode 的取值语义见上面的语义表。
   ParametrizedInsideFunc (int mode)
     : m_mode (mode)
   {
     //  .. nothing yet ..
   }
 
+  // [[ZH]] 功能：判断环绕数 wc 是否算作"内部"。见上面的 mode 语义表。
   inline bool operator() (int wc) const
   {
     if (m_mode > 0) {
+      // [[ZH]] mode = +n：只认正环绕数，要求 wc >= n。
       return wc >= m_mode;
     } else if (m_mode < 0) {
+      // [[ZH]] mode = -n：两边都认，等价于 |wc| >= n。
+      // [[ZH]] mode = -1（默认）即"非零环绕规则"。
       return wc <= m_mode || -wc <= m_mode;
     } else {
+      // [[ZH]] mode = 0：奇偶规则。对负数先取绝对值再判奇偶。
       return (wc < 0 ? ((-wc) % 2) : (wc % 2)) != 0;
     }
   }
 
 public:
+  // [[ZH]] m_mode：上面语义表里的模式值。构造时设定，之后不再改变。
   int m_mode;
 };
 
@@ -936,9 +979,62 @@ private:
  *  applying a custom operator for computing the output edge sets which then are delivered
  *  to an EdgeSink receiver object.
  */
+// [[ZH-BEGIN]]
+// ============================================================================
+//  EdgeProcessor —— 公开门面（用户实际使用的类）
+// ============================================================================
+//
+// 【心智模型】
+//   把 EdgeProcessor 想象成一台"边的布尔运算机"：
+//       [投入] 一堆边/多边形 + 一个评估器 + 一个输出 sink
+//       [产出] 经"去相交 → 打断 → 扫描线求值"后，由 sink 收到的结果
+//
+//   典型三步用法（记住这个模式，80% 的场景都是它）：
+//       1) 用 insert()/insert_sequence() 把输入边或整个多边形灌进去
+//       2) 准备好 一个 EdgeEvaluatorBase（评估器）+ 一个 EdgeSink（输出端）
+//       3) 调用 process(sink, evaluator)
+//
+//   若你只是做常见的布尔/合并/放大，**不必自己写评估器与 sink**：
+//   直接用下面的 bulk 便捷函数（simple_merge / merge / size / boolean），
+//   它们已经把"插入 + 选评估器 + 选 sink + 缝合多边形"全部打包好了。
+//
+// 【API 分组速览】
+//   配置：  enable_progress / disable_progress / set_base_verbosity
+//   投入：  insert(...)          —— 边、Polygon、SimplePolygon、PolygonRef（含带变换版本）
+//           insert_sequence(...) —— 批量插入边序列
+//           reserve / count / clear
+//   处理：  process(sink, evaluator)        单输出
+//           process(vector<pair<sink,evaluator>>)  ★ 一次扫描、多路输出（高效）
+//           redo(...)                        复用已准备的边表重跑（跳过阶段 2、3）
+//   便捷：  simple_merge(...)  按环绕数融合（mode 见 ParametrizedInsideFunc）
+//           merge(...)         每个多边形独立归一化后融合（min_wc = 最小重叠数）
+//           size(...)          尺寸放大/缩小（各向异性，dx/dy 可不同）
+//           boolean(...)       两操作数的布尔运算（And/ANotB/BNotA/Xor/Or）
+//   输出端：结果通过 EdgeSink 投递（见 EdgeSink 与 dbPolygonGenerators.h）
+//
+// 【★ 三个必须知道的行为特性】
+//   1) **有状态、可复用**：边一旦 insert 就留在内部；process() 可以反复调用，
+//      每次换不同的评估器/sink 得到不同结果。redo() 更进一步，跳过昂贵的
+//      阶段 2、3（求交与打断），只重跑扫描线 —— 适合"同一批输入、多种输出"的场景。
+//   2) **不是线程安全的**：所有状态都在对象内部。多线程请各线程各用各的实例。
+//   3) 效率上，process() 处理的是**拷贝**出来的工作边表，代价主要在阶段 2（求交）。
+//
+// 【property 约定（做布尔运算时必须遵守）】
+//   boolean() 对多边形的约定：操作数 A 用偶数 property（0,2,4,...），
+//   操作数 B 用奇数（1,3,5,...）—— 即评估器靠 `p % 2` 区分 A/B。
+//   若不按此约定填 property，BooleanOp 会把输入理解错。
+//
+// 【常见坑速查】
+//   · 零点长的边在 insert 时被**静默丢弃**（不报错、不抛异常）——见 .cc 的 insert。
+//   · 输入**不做任何合法性校验**，畸形多边形不会被拒绝，只会得到奇怪结果。
+//   · 想要多边形结果时，记得 sink 要选 PolygonGenerator 一类（EdgeProcessor 自己
+//     只输出边）；见 dbPolygonGenerators.h。
+//   · 若输入量很大，务必用 reserve() 预留容量。
+// [[ZH-END]]
 class DB_PUBLIC EdgeProcessor
 {
 public:
+  // [[ZH]] property_type = size_t：边的"来源标签"类型，详见文件头关于 property 的说明。
   typedef size_t property_type;
 
   /**
@@ -947,6 +1043,9 @@ public:
    *  @param report_progress If true, a tl::Progress object will be created to report any progress (warning: this will impose a performance penalty)
    *  @param progress_text The description text of the progress object
    */
+  // [[ZH]] 功能：构造一台空闲的边处理器（内部边表为空）。
+  // [[ZH]] 参数：report_progress 是否上报进度（★ 会带来可观测的性能损失，批量运算时建议关闭）；
+  // [[ZH]]       progress_text 进度条上显示的描述文字。
   EdgeProcessor (bool report_progress = false, const std::string &progress_desc = std::string ());
 
   /**
@@ -1100,6 +1199,26 @@ public:
    *  This method will use the edges stored so far and runs it through the
    *  scanline algorithm.
    */
+  // [[ZH-BEGIN]]
+  // 功能：★ 执行核心处理 —— 把目前 insert 进来的所有边跑一遍扫描线算法，
+  //       结果按顺序投递给 sink `es`。
+  //
+  // 参数：es 结果接收端（EdgeSink 的子类实例）。
+  //       op 评估器（决定每段边算不算结果）。
+  //
+  // 执行过程（即文件头所说的四阶段）：prep → intersections → split → production。
+  //   ★ 前三个阶段（尤其"求交点"）通常占总耗时的绝大部分；
+  //     若你要用同一批输入做多种运算，请优先考虑 redo()，它能跳过前三个阶段。
+  //
+  // 副作用：
+  //   · 会修改本对象内部的工作边表（把边按交点打断、排序）。
+  //     **原始 insert 进来的边顺序不再保留** —— 这是一次性的破坏性变换。
+  //   · 会重置 sink 的停止标志、重置 op 的状态。
+  //   · 注意 es 与 op 都是**引用**：它们的生命周期由调用者管理，且引擎会保留指针，
+  //     所以不要让它们比本次调用更早析构。
+  //
+  // 坑：本函数**不检查** es/op 是否为空。传入空指针会崩溃。
+  // [[ZH-END]]
   void process (db::EdgeSink &es, EdgeEvaluatorBase &op);
 
   /**
@@ -1109,6 +1228,21 @@ public:
    *  Each evaluator is worked on separately and feeds the corresponding
    *  edge sink.
    */
+  // [[ZH-BEGIN]]
+  // 功能：★ 一次扫描、多路输出 —— 用同一批边同时喂给多个 (sink, evaluator) 对。
+  //
+  // 参数：gen 形如 [(sink1, eval1), (sink2, eval2), ...] 的列表。
+  //
+  // ★ 为什么这个重载很重要（性能原因）：
+  //   求交点/打断边（阶段 2、3）是本算法最昂贵的部分，且**只取决于输入边**，
+  //   与评估器无关。所以想同时算 AND 和 A-NOT-B 时：
+  //       错误做法：调用两次 process()  → 昂贵的阶段 2、3 白跑两遍
+  //       正确做法：一次 process(gen)    → 阶段 2、3 只跑一遍
+  //   这在单元测试 TEST(9twobool) 中有完整示例（同时求 AND 与 A-NOT-B）。
+  //
+  // 实现：内部为每个 sink/evaluator 对维护一份独立的扫描线状态，
+  //       单路与多路在 EdgeProcessorStates 中被统一处理。
+  // [[ZH-END]]
   void process (const std::vector<std::pair<db::EdgeSink *, db::EdgeEvaluatorBase *> > &gen);
 
   /**
@@ -1118,6 +1252,20 @@ public:
    *  scanline algorithm. This is somewhat more efficient as the initial
    *  sorting and edge clipping can be skipped.
    */
+  // [[ZH-BEGIN]]
+  // 功能：重跑处理。与 process() 结果等价，但**跳过阶段 2（求交）和阶段 3（打断）**，
+  //       只重跑阶段 4（扫描线投递）。
+  //
+  // 前提：★ 必须先成功调用过一次 process()（或 redo()）。
+  //       否则内部工作边表还是原始未打断的状态，结果不正确。
+  //
+  // 用途：同一批输入、多种输出时的高效写法：
+  //       ep.process (sink1, eval1);   // 第一次：做完整工作（含求交）
+  //       ep.redo    (sink2, eval2);   // 后续：复用已打断的边表，快得多
+  //
+  // 注意：反复 redo 时结果会被重复投递；若 sink 会累积内容，记得自行清空
+  //       （EdgeContainer 的构造参数 clear 就是为此设计的）。
+  // [[ZH-END]]
   void redo (db::EdgeSink &es, EdgeEvaluatorBase &op);
 
   /**
@@ -1127,6 +1275,8 @@ public:
    *  scanline algorithm. This is somewhat more efficient as the initial
    *  sorting and edge clipping can be skipped.
    */
+  // [[ZH]] 功能：redo 的多路输出版本，含义与 process(gen) 相同，但跳过阶段 2、3。
+  // [[ZH]] 前提：同样必须先调用过一次 process()。适用于"同一批输入 + 多个后续运算"。
   void redo (const std::vector<std::pair<db::EdgeSink *, db::EdgeEvaluatorBase *> > &gen);
 
   /**
